@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"sync"
 
 	"github.com/samuael/trading_bot/engine/spread"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/gateio"
@@ -18,8 +19,11 @@ func main() {
 	// if apiKey != "" && apiSecret != "" {
 	e.API.AuthenticatedSupport = true
 	e.API.AuthenticatedWebsocketSupport = true
-	e.SetCredentials("apiKey", "apiSecret", "", "", "", "")
+	// sam
+	e.SetCredentials("", "", "", "", "", "")
 	// }
-
-	go spread.RunGateIO(context.TODO(), &spread.Toggle{}, &gateio.Exchange{})
+	wg := new(sync.WaitGroup)
+	wg.Add(1)
+	go spread.RunGateIO(context.Background(), &spread.Toggle{}, e, wg)
+	wg.Wait()
 }

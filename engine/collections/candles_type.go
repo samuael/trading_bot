@@ -15,6 +15,3 @@ type AssetCandles struct {
 type Candles struct {
 	PairCandles []AssetCandles
 }
-
-
-

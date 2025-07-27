@@ -2,6 +2,7 @@ package collections
 
 import (
 	"context"
+	"strings"
 
 	"github.com/thrasher-corp/gocryptotrader/currency"
 	exchange "github.com/thrasher-corp/gocryptotrader/exchanges"
@@ -32,38 +33,80 @@ type TradingDetail struct {
 	Matches                  map[PairInfo]map[asset.Item]InstrumentInfo
 }
 
-func (detail *TradingDetail) UpdateExchangeTradingDetails(ctx context.Context, exch exchange.IBotExchange, settlement currency.Code, assets ...asset.Item) error {
-	for i := range assets {
-		pairs, err := exch.GetAvailablePairs(assets[i])
+func (detail *TradingDetail) UpdateExchangeTradingDetails(ctx context.Context, exch exchange.IBotExchange, settlement currency.Code, spotPairs []gateio.CurrencyPairDetail, contracts []gateio.FuturesContract) error {
+	err := exch.UpdateTradablePairs(ctx, true)
+	if err != nil {
+		return err
+	}
+
+	spotCount := 0
+	futuresCount := 0
+
+	pairFormat, err := exch.GetPairFormat(asset.Spot, true)
+	if err != nil {
+		return err
+	}
+
+	for _, sp := range spotPairs {
+		if (sp.Type != "" && !strings.EqualFold(sp.Type, "normal")) || !sp.DelistingTime.Time().IsZero() || (sp.TradeStatus != "" && !strings.EqualFold(sp.TradeStatus, "tradable")) {
+			continue
+		}
+		if !strings.EqualFold(settlement.String(), currency.NewCode(sp.Quote).String()) {
+			continue
+		}
+		p, err := exch.MatchSymbolWithAvailablePairs(sp.ID /* sp.Base+"_"+sp.Quote */, asset.Spot, true)
 		if err != nil {
 			return err
 		}
-		pairFormat, err := exch.GetPairFormat(assets[i], true)
-		if err != nil {
-			return err
+		p = p.Format(pairFormat)
+
+		if detail.PerpetualInstrumentsList[PairInfo{p.Base, p.Quote}] == nil {
+			detail.PerpetualInstrumentsList[PairInfo{p.Base, p.Quote}] = make(map[asset.Item]InstrumentInfo)
 		}
-		for _, p := range pairs {
-			if p.Quote != settlement {
-				continue
-			}
-			if detail.PerpetualInstrumentsList[PairInfo{p.Base, p.Quote}] == nil {
-				detail.PerpetualInstrumentsList[PairInfo{p.Base, p.Quote}] = make(map[asset.Item]InstrumentInfo)
-			}
-			detail.PerpetualInstrumentsList[PairInfo{p.Base, p.Quote}][assets[i]] = InstrumentInfo{
-				Symbol: pairFormat.Format(p),
-				Perpetual: func() bool {
-					if assets[i] == asset.Spot {
-						return true
-					}
-					isPerp, err := exch.(*gateio.Exchange).IsPerpetualFutureCurrency(assets[i], p.Format(pairFormat))
-					if err != nil {
-						return false
-					}
-					return isPerp
-				}(),
-			}
+
+		spotCount += 1
+		detail.PerpetualInstrumentsList[PairInfo{p.Base, p.Quote}][asset.Spot] = InstrumentInfo{
+			Symbol:    sp.ID,
+			Perpetual: true,
 		}
 	}
+
+	futuresFormat, err := exch.GetPairFormat(asset.USDTMarginedFutures, true)
+	if err != nil {
+		return err
+	}
+	var average int64
+	var count int64
+	for _, contract := range contracts {
+		if contract.InDelisting || (contract.Type != "" && !strings.EqualFold(contract.Type, "direct")) || contract.LeverageMin > 1 {
+			continue
+		}
+		pairString := strings.ToUpper(contract.Name)
+		if !exch.(*gateio.Exchange).IsValidPairString(pairString) {
+			continue
+		}
+		p, err := currency.NewPairFromString(pairString)
+		if err != nil {
+			return err
+		}
+		// if count > 0 {
+		// 	if contract.TradeSize < int64(math.Ceil(float64(average/count)*0.3)) {
+		// 		continue
+		// 	}
+		// }
+		average += contract.TradeSize
+		count += 1
+		p = p.Format(futuresFormat)
+		if detail.PerpetualInstrumentsList[PairInfo{p.Base, p.Quote}] == nil {
+			detail.PerpetualInstrumentsList[PairInfo{p.Base, p.Quote}] = make(map[asset.Item]InstrumentInfo)
+		}
+		futuresCount += 1
+		detail.PerpetualInstrumentsList[PairInfo{p.Base, p.Quote}][asset.USDTMarginedFutures] = InstrumentInfo{
+			Symbol:    contract.Name,
+			Perpetual: true,
+		}
+	}
+	println("Spot Count: ", spotCount, " Futures Count: ", futuresCount, "\n")
 	return nil
 }
 
@@ -74,8 +117,14 @@ type MatchInfo struct {
 	SpotSymbol   string
 	FutureSymbol string
 
-	FuturesDetail kline.Item
-	SpotCandles   kline.Item
+	FuturesCandles *kline.Item
+	SpotCandles    *kline.Item
+
+	Spread     float64
+	LastSpread float64
+
+	Eligible bool
+	Diff     float64
 }
 
 func (detail *TradingDetail) UpdateMatches() []MatchInfo {
