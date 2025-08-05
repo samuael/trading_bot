@@ -140,10 +140,36 @@ func TestCancelOrder(t *testing.T) {
 	require.NoError(t, err)
 
 	for p := range allPositions {
-		err := e.(*gateio.Exchange).CancelOrder(context.Background(), &order.Cancel{
-			AssetType: asset.USDTMarginedFutures,
-			OrderID:   allPositions[p].Contract,
+		// println("Position with ID: ", allPositions[p].Contract, allPositions[p].Leverage)
+		contract, err := currency.NewPairFromString(allPositions[p].Contract)
+		require.NoError(t, err)
+
+		var autoSize string
+		if allPositions[p].Mode == "dual_long" {
+			autoSize = "close_long"
+		} else {
+			autoSize = "close_short"
+		}
+		_, err = e.(*gateio.Exchange).PlaceFuturesOrder(context.Background(), &gateio.ContractOrderCreateParams{
+			Contract:      contract,
+			Size:          0,
+			ClosePosition: false,
+			// IsClose:       true,
+			ReduceOnly:  true,
+			TimeInForce: "ioc",
+			Settle:      currency.USDT,
+			AutoSize:    autoSize,
+			// SelfTradePreventionAction: "",
 		})
 		require.NoError(t, err)
+		// assert.Equal(t, true, result.)
 	}
+}
+
+func TestUpdateFuturesPositionLeverage(t *testing.T) {
+	t.Parallel()
+	e.(*gateio.Exchange).Verbose = true
+	position, err := e.(*gateio.Exchange).UpdateFuturesPositionLeverage(context.Background(), currency.USDT, currency.Pair{Base: currency.NewCode("SHM"), Quote: currency.USDT, Delimiter: currency.UnderscoreDelimiter}, 0, 1)
+	require.NoError(t, err)
+	assert.NotNil(t, position)
 }
