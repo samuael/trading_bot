@@ -34,12 +34,9 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// if apiKey != "" && apiSecret != "" {
 	e.API.AuthenticatedSupport = true
 	e.API.AuthenticatedWebsocketSupport = true
-	// sam
 	e.SetCredentials("", "", "", "", "", "")
-	// }
 
 	f, err := os.OpenFile("profit_log.csv", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -48,7 +45,6 @@ func main() {
 	defer f.Close()
 
 	logger := log.New(f, "", log.LstdFlags)
-	// profit := getProfit()
 
 	go startMetricsServer()
 

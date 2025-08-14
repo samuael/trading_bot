@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -56,11 +57,13 @@ func GetFuturesAssetsFromExchange(exch exchange.IBotExchange) []asset.Item {
 
 func RunGateIO(ctx context.Context, toggle *Toggle, exch *gateio.Exchange, logger *nlog.Logger, strategyBalance *prometheus.GaugeVec, wg *sync.WaitGroup) {
 	defer wg.Done()
-	hourTimer := time.NewTimer(0)
+	hourTimer := time.NewTicker(time.Hour)
 	// twentyFourHourTimer := time.NewTimer(time.Second)
-	tenSecondTimer := time.NewTimer(time.Second * 10)
-	fiveSecondTimer := time.NewTimer(time.Second * 5)
-	fiveMinTimer := time.NewTicker(time.Minute * 5)
+	tenMinuteTimer := time.NewTicker(time.Minute * 10)
+	twentySecondsTicker := time.NewTicker(time.Second * 20)
+	fiveMinTicker := time.NewTicker(time.Minute * 5)
+	sixHourTimer := time.NewTimer(0)
+
 	settlement := currency.USDT
 
 	var matches []collections.MatchInfo
@@ -76,47 +79,56 @@ func RunGateIO(ctx context.Context, toggle *Toggle, exch *gateio.Exchange, logge
 	details := new(collections.TradingDetail)
 	details.PerpetualInstrumentsList = make(map[collections.PairInfo]map[asset.Item]collections.InstrumentInfo)
 
-	spotPairsList, err := exch.ListSpotCurrencyPairs(ctx)
-	if err != nil {
-		log.Errorf(strategy, "%v, fatal", err)
-	}
-
-	contracts, err := exch.GetAllFutureContracts(ctx, settlement)
-	if err != nil {
-		log.Errorf(strategy, "%v, fatal", err)
-	}
+	var spotPairsList []gateio.CurrencyPairDetail
+	var contracts []gateio.FuturesContract
 
 	var allPositions []gateio.Position
 
+	usdtmFuturesFormat, err := exch.GetPairFormat(asset.USDTMarginedFutures, true)
+	if err != nil {
+		panic(err)
+	}
+
+	// spotFormat, err := exch.GetPairFormat(asset.Spot, true)
+	// if err != nil {
+	// 	panic(err)
+	// }
+
+	// websocket, err
+	// futuresConnection, err := exch.Websocket.GetConnection(asset.USDTMarginedFutures)
+	// if err != nil {
+	// 	panic(err)
+	// }
+	// spotConnection, err := exch.Websocket.GetConnection(asset.Spot)
+	// if err != nil {
+	// 	panic(err)
+	// }
+
+	// err = exch.WsFuturesConnect(context.Background(), futuresConnection)
+	// if err != nil {
+	// 	panic(err)
+	// }
+
+	// err = exch.WsConnectSpot(context.Background(), spotConnection)
+	// if err != nil {
+	// 	panic(err)
+	// }
+
 	for {
 		select {
-		case <-hourTimer.C:
-			if tradesPerHour != 0 {
-				strategyBalance.WithLabelValues("Trades Per Hour").Set(float64(tradesPerHour))
-				tradesPerHour = 0
-			}
-			hourTimer.Reset(time.Until(time.Now().Truncate(time.Hour).Add(time.Hour)))
-			if toggle.Verbose {
-				log.Debugf(strategy, "running hourly sync")
-			}
-
-			if toggle.InitialRunComplete {
-				// When starting the application the pairs are initially updated, every hour after that we can flush the
-				// pairs.
-				if toggle.Verbose {
-					log.Debugf(strategy, "updating pairs")
-				}
-				go func() {
-					if err := exch.UpdateTradablePairs(ctx, false); err != nil {
-						log.Errorf(strategy, "failed to update pairs: %v", err)
-					}
-				}()
+		case <-sixHourTimer.C:
+			// time.Hour * 6
+			sixHourTimer.Reset(time.Until(time.Now().Truncate(time.Hour).Add(time.Hour * 6)))
+			var err error
+			spotPairsList, err = exch.ListSpotCurrencyPairs(ctx)
+			if err != nil {
+				log.Errorf(strategy, "%v, fatal", err)
 			}
 
-			if toggle.Verbose {
-				log.Debugf(strategy, "updating contract details")
+			contracts, err = exch.GetAllFutureContracts(ctx, settlement)
+			if err != nil {
+				log.Errorf(strategy, "%v, fatal", err)
 			}
-
 			if err := details.UpdateExchangeTradingDetails(ctx, exch, settlement, spotPairsList, contracts); err != nil {
 				if !toggle.InitialRunComplete {
 					panic(err)
@@ -140,267 +152,303 @@ func RunGateIO(ctx context.Context, toggle *Toggle, exch *gateio.Exchange, logge
 			if err != nil {
 				log.Errorf(strategy, "error: %v", err)
 			}
+		case <-hourTimer.C:
+			if tradesPerHour != 0 {
+				strategyBalance.WithLabelValues("Trades Per Hour").Set(float64(tradesPerHour))
+				tradesPerHour = 0
+			}
+			hourTimer.Reset(time.Until(time.Now().Truncate(time.Hour).Add(time.Hour)))
+			if toggle.Verbose {
+				log.Debugf(strategy, "running hourly sync")
+			}
+
+			if toggle.InitialRunComplete {
+				// When starting the application the pairs are initially updated, every hour after that we can flush the
+				// pairs.
+				if toggle.Verbose {
+					log.Debugf(strategy, "updating pairs")
+				}
+				if err := exch.UpdateTradablePairs(ctx, false); err != nil {
+					log.Errorf(strategy, "failed to update pairs: %v", err)
+					panic(err)
+				}
+			}
+
+			if toggle.Verbose {
+				log.Debugf(strategy, "updating contract details")
+			}
 
 			println("selectedMatches: ", len(selectedMatches))
 
-			err = UpdateStat(exch, selectedMatches)
+			err := UpdateStat(exch, selectedMatches)
 			if err != nil {
 				log.Errorf(strategy, "error: %v", err)
+				panic(err)
 			}
 			for a := range selectedMatches {
 				println(selectedMatches[a].SpotSymbol, selectedMatches[a].Spread, selectedMatches[a].LastSpread, selectedMatches[a].Eligible)
 			}
 
-			// sort based on their diff value.
-			filteredMatches := SortMatches(selectedMatches, 1)
-
-			// get account balance information.
-
-			// spotAccount, err := exch.GetSpotAccounts(context.Background(), currency.USDT)
-			// if err != nil {
-			// 	log.Errorf(strategy, "error: %v", err)
-			// }
-
-			futuresAccount, err := exch.QueryFuturesAccount(context.Background(), currency.USDT)
-			if err != nil {
-				log.Errorf(strategy, "error: %v", err)
-			}
-
-			// Save the 10 percent for margin.
-			futuresAccount.Available -= futuresAccount.Available * .1
-
-			for s := range filteredMatches {
-				if futuresAccount.Available.Float64() < 10 {
-					break
-				}
-				var nextBalance float64
-				if futuresAccount.Available.Float64() > 20 {
-					nextBalance = 20.00
-					futuresAccount.Available -= 20
-				} else {
-					nextBalance = futuresAccount.Available.Float64()
-					futuresAccount.Available = 0
-				}
-				contract := currency.Pair{Base: filteredMatches[s].Base, Quote: filteredMatches[s].Quote}
-				// setting the leverages.
-				_, err := exch.UpdateFuturesPositionLeverage(context.Background(), settlement, contract, 1, 1)
-				if err != nil {
-					log.Errorf(strategy, "error: %v", err)
-					continue
-				}
-
-				switch {
-				case filteredMatches[s].Spread > 0 && filteredMatches[s].LastSpread > 0:
-					// position.
-					_, err := exch.SubmitOrder(context.Background(), &order.Submit{
-						Exchange:    exch.GetName(),
-						Pair:        contract,
-						TimeInForce: order.FillOrKill,
-						Type:        order.Market,
-						AssetType:   asset.USDTMarginedFutures,
-						Side:        order.Short,
-						Amount:      nextBalance,
-						Leverage:    1,
-					})
-					if err != nil {
-						log.Errorf(strategy, "error: %v", err)
-					}
-					tradesPerHour += 1
-					// orderDetails = append(orderDetails, result)
-				case filteredMatches[s].Spread > 0 && filteredMatches[s].LastSpread < 0:
-					_, err := exch.SubmitOrder(context.Background(), &order.Submit{
-						Exchange:    exch.GetName(),
-						Pair:        currency.Pair{Base: filteredMatches[s].Base, Quote: filteredMatches[s].Quote},
-						TimeInForce: order.FillOrKill,
-						Type:        order.Market,
-						AssetType:   asset.USDTMarginedFutures,
-						Side:        order.Long,
-						Amount:      nextBalance,
-						Leverage:    1,
-					})
-					if err != nil {
-						log.Errorf(strategy, "error: %v", err)
-					}
-					tradesPerHour += 1
-					// orderDetails = append(orderDetails, result)
-				case filteredMatches[s].Spread < 0 && filteredMatches[s].LastSpread < 0:
-					_, err := exch.SubmitOrder(context.Background(), &order.Submit{
-						Exchange:    exch.GetName(),
-						Pair:        currency.Pair{Base: filteredMatches[s].Base, Quote: filteredMatches[s].Quote},
-						TimeInForce: order.FillOrKill,
-						Type:        order.Market,
-						AssetType:   asset.USDTMarginedFutures,
-						Side:        order.Long,
-						Amount:      nextBalance,
-						Leverage:    1,
-					})
-					if err != nil {
-						log.Errorf(strategy, "error: %v", err)
-					}
-					tradesPerHour += 1
-					// orderDetails = append(orderDetails, result)
-				case filteredMatches[s].Spread < 0 && filteredMatches[s].LastSpread > 0:
-					_, err := exch.SubmitOrder(context.Background(), &order.Submit{
-						Exchange:    exch.GetName(),
-						Pair:        currency.Pair{Base: filteredMatches[s].Base, Quote: filteredMatches[s].Quote},
-						TimeInForce: order.FillOrKill,
-						Type:        order.Market,
-						AssetType:   asset.USDTMarginedFutures,
-						Side:        order.Short,
-						Amount:      nextBalance,
-						Leverage:    1,
-					})
-					if err != nil {
-						log.Errorf(strategy, "error: %v", err)
-					}
-					tradesPerHour += 1
-					// orderDetails = append(orderDetails, result)
-				}
-				// break
-			}
-		case <-fiveMinTimer.C:
-			if len(selectedMatches) < 3 {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					selectedMatches, err = UpdateStats(matches)
-					if err != nil {
-						log.Errorf(strategy, "error: %v", err)
-					}
-
-					println("selectedMatches: ", len(selectedMatches))
-				}()
-			}
-			// log the balance
-
-			futuresAccount, err := exch.QueryFuturesAccount(context.Background(), currency.USDT)
-			if err != nil {
-				log.Errorf(strategy, "error: %v", err)
-			}
-
-			println("futuresAccount.Available: ", futuresAccount.Available.Float64())
-			// logger.SetOutput(f)
-			strategyBalance.WithLabelValues("SpotPerpetualSpreadArbitrage_GateIO").Set(futuresAccount.Available.Float64())
-			logger.Printf("%s,%.2f\n", time.Now().Format(time.RFC3339), futuresAccount.Available.Float64())
-		case <-fiveSecondTimer.C:
-			err = UpdateStat(exch, selectedMatches)
-			if err != nil {
-				log.Errorf(strategy, "error: %v", err)
-			}
-
-			for a := range selectedMatches {
-				println(selectedMatches[a].SpotSymbol, selectedMatches[a].Spread, selectedMatches[a].LastSpread, selectedMatches[a].Eligible)
-			}
-
-			// sort based on their diff value.
-			filteredMatches := SortMatches(selectedMatches, 3)
-			futuresAccount, err := exch.QueryFuturesAccount(context.Background(), currency.USDT)
-			if err != nil {
-				log.Errorf(strategy, "error: %v", err)
-			}
-
-			// Save the 10 percent for margin
-			futuresAccount.Available -= futuresAccount.Available * .1
-
-			for s := range filteredMatches {
-				if futuresAccount.Available < 10 {
-					break
-				}
-				var nextBalance float64
-				if futuresAccount.Available > 10 {
-					nextBalance = 10.00
-					futuresAccount.Available -= 10
-				} else {
-					nextBalance = futuresAccount.Available.Float64()
-					futuresAccount.Available = 0
-				}
-
-				contract := currency.Pair{Base: filteredMatches[s].Base, Quote: filteredMatches[s].Quote}
-				// setting the leverages.
-				_, err = exch.UpdateFuturesPositionLeverage(context.Background(), settlement, contract, 1, 1)
-				if err != nil {
-					log.Errorf(strategy, "error: %v", err)
-					continue
-				}
-
-				switch {
-				case filteredMatches[s].Spread > 0 && filteredMatches[s].LastSpread > 0:
-					_, err := exch.SubmitOrder(context.Background(), &order.Submit{
-						Exchange:    exch.GetName(),
-						Pair:        contract,
-						TimeInForce: order.FillOrKill,
-						Type:        order.Market,
-						AssetType:   asset.USDTMarginedFutures,
-						Side:        order.Short,
-						Amount:      nextBalance,
-						Leverage:    1,
-					})
-					if err != nil {
-						log.Errorf(strategy, "error: %v", err)
-					}
-					tradesPerHour += 1
-					// orderDetails = append(orderDetails, result)
-				case filteredMatches[s].Spread > 0 && filteredMatches[s].LastSpread < 0:
-					_, err := exch.SubmitOrder(context.Background(), &order.Submit{
-						Exchange:    exch.GetName(),
-						Pair:        currency.Pair{Base: filteredMatches[s].Base, Quote: filteredMatches[s].Quote},
-						TimeInForce: order.FillOrKill,
-						Type:        order.Market,
-						AssetType:   asset.USDTMarginedFutures,
-						Side:        order.Long,
-						Amount:      nextBalance,
-					})
-					if err != nil {
-						log.Errorf(strategy, "error: %v", err)
-					}
-					tradesPerHour += 1
-					// orderDetails = append(orderDetails, result)
-				case filteredMatches[s].Spread < 0 && filteredMatches[s].LastSpread < 0:
-					_, err := exch.SubmitOrder(context.Background(), &order.Submit{
-						Exchange:    exch.GetName(),
-						Pair:        currency.Pair{Base: filteredMatches[s].Base, Quote: filteredMatches[s].Quote},
-						TimeInForce: order.FillOrKill,
-						Type:        order.Market,
-						AssetType:   asset.USDTMarginedFutures,
-						Side:        order.Long,
-						Amount:      nextBalance,
-					})
-					if err != nil {
-						log.Errorf(strategy, "error: %v", err)
-					}
-					tradesPerHour += 1
-					// orderDetails = append(orderDetails, result)
-				case filteredMatches[s].Spread < 0 && filteredMatches[s].LastSpread > 0:
-					_, err := exch.SubmitOrder(context.Background(), &order.Submit{
-						Exchange:    exch.GetName(),
-						Pair:        currency.Pair{Base: filteredMatches[s].Base, Quote: filteredMatches[s].Quote},
-						TimeInForce: order.FillOrKill,
-						Type:        order.Market,
-						AssetType:   asset.USDTMarginedFutures,
-						Side:        order.Short,
-						Amount:      nextBalance,
-					})
-					if err != nil {
-						log.Errorf(strategy, "error: %v", err)
-					}
-					tradesPerHour += 1
-					// orderDetails = append(orderDetails, result)
-				}
-				// break
-			}
-		case <-tenSecondTimer.C:
+			// Get open positions and
 			allPositions, err = exch.GetAllFuturesPositionsOfUsers(context.Background(), currency.USDT, true)
 			if err != nil {
 				log.Errorf(strategy, "failed to update positions: %v", err)
 				panic(err)
 			}
 
-			err = UpdateStat(exch, selectedMatches)
+			// Check if there is an already open position and skip if there is an open position.
+			if len(allPositions) > 0 {
+				continue
+			}
+
+			// sort based on their diff value.
+			filteredMatches := SortMatches(selectedMatches, 1)
+
+			// get account balance information.
+			futuresAccount, err := exch.QueryFuturesAccount(context.Background(), currency.USDT)
+			if err != nil {
+				log.Errorf(strategy, "error: %v", err)
+				panic(err)
+			}
+
+			// Save the 10 percent for margin.
+			futuresAccount.Available -= futuresAccount.Available * .1
+
+			for s := range filteredMatches {
+				if futuresAccount.Available.Float64() < 5 {
+					break
+				}
+				var nextBalance float64
+				if futuresAccount.Available.Float64() >= 5 {
+					nextBalance = 5.00
+					futuresAccount.Available -= 5
+				} else {
+					nextBalance = futuresAccount.Available.Float64()
+					futuresAccount.Available = 0
+				}
+
+				contract := currency.Pair{Base: filteredMatches[s].Base, Quote: filteredMatches[s].Quote}.Format(usdtmFuturesFormat)
+				switch {
+				case filteredMatches[s].Spread > 0 && filteredMatches[s].LastSpread > 0,
+					filteredMatches[s].Spread < 0 && filteredMatches[s].LastSpread > 0:
+					for c := range allPositions {
+						if allPositions[c].Contract == contract.String() && allPositions[c].Size > 0 {
+							err := ClosePosition(exch, contract, "close_long")
+							if err != nil {
+								log.Errorf(strategy, "failed to update positions: %v", err)
+								panic(err)
+							}
+						}
+					}
+					// position
+					_, err := exch.SubmitOrder(context.Background(), &order.Submit{
+						Exchange:    exch.GetName(),
+						Pair:        contract,
+						TimeInForce: order.FillOrKill,
+						Type:        order.Market,
+						AssetType:   asset.USDTMarginedFutures,
+						Side:        order.Short,
+						Amount:      nextBalance,
+						Leverage:    1,
+					})
+					if err != nil {
+						log.Errorf(strategy, "error: %v", err)
+						panic(err)
+					}
+					tradesPerHour += 1
+					// orderDetails = append(orderDetails, result)
+				case filteredMatches[s].Spread > 0 && filteredMatches[s].LastSpread < 0,
+					filteredMatches[s].Spread < 0 && filteredMatches[s].LastSpread < 0:
+					for c := range allPositions {
+						if allPositions[c].Contract == contract.String() && allPositions[c].Size < 0 {
+							err := ClosePosition(exch, contract, "close_short")
+							if err != nil {
+								log.Errorf(strategy, "failed to update positions: %v", err)
+								panic(err)
+							}
+						}
+					}
+					_, err := exch.SubmitOrder(context.Background(), &order.Submit{
+						Exchange:    exch.GetName(),
+						Pair:        currency.Pair{Base: filteredMatches[s].Base, Quote: filteredMatches[s].Quote},
+						TimeInForce: order.FillOrKill,
+						Type:        order.Market,
+						AssetType:   asset.USDTMarginedFutures,
+						Side:        order.Long,
+						Amount:      nextBalance,
+						Leverage:    1,
+					})
+					if err != nil {
+						log.Errorf(strategy, "error: %v", err)
+						panic(err)
+					}
+					tradesPerHour += 1
+					// orderDetails = append(orderDetails, result)
+				}
+				// setting the leverages.
+				_, err = exch.UpdateFuturesPositionLeverage(context.Background(), settlement, contract, 1, 1)
+				if err != nil {
+					log.Errorf(strategy, "error: %v", err)
+					continue
+				}
+				// break
+			}
+		case <-fiveMinTicker.C:
+			// Update stats of selected instruments.
+			if len(selectedMatches) < 3 {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					var err error
+					selectedMatches, err = UpdateStats(matches)
+					if err != nil {
+						log.Errorf(strategy, "error: %v", err)
+						panic(err)
+					}
+
+					println("selectedMatches: ", len(selectedMatches))
+				}()
+			}
+
+			// log the balance
+			futuresAccount, err := exch.QueryFuturesAccount(context.Background(), currency.USDT)
+			if err != nil {
+				log.Errorf(strategy, "error: %v", err)
+				panic(err)
+			}
+
+			println("futuresAccount.Available: ", futuresAccount.Available.Float64())
+			// logger.SetOutput(f)
+			strategyBalance.WithLabelValues("SpotPerpetualSpreadArbitrage_GateIO").Set(futuresAccount.Total.Float64())
+			logger.Printf("%s,%.2f\n", time.Now().Format(time.RFC3339), futuresAccount.Total.Float64())
+		case <-tenMinuteTimer.C:
+			// Get open positions and
+			allPositions, err = exch.GetAllFuturesPositionsOfUsers(context.Background(), currency.USDT, true)
 			if err != nil {
 				log.Errorf(strategy, "failed to update positions: %v", err)
 				panic(err)
 			}
 
+			// If there is an open position, then skip this place.
+			if len(allPositions) > 0 {
+				continue
+			}
+
+			var err error
+			err = UpdateStat(exch, selectedMatches)
+			if err != nil {
+				log.Errorf(strategy, "error: %v", err)
+			}
+
+			// sort based on their diff value.
+			filteredMatches := SortMatches(selectedMatches, 1)
+
+			futuresAccount, err := exch.QueryFuturesAccount(context.Background(), currency.USDT)
+			if err != nil {
+				log.Errorf(strategy, "error: %v", err)
+				panic(err)
+			}
+
+			// Save the 10 percent for margin
+			futuresAccount.Available -= futuresAccount.Available * .1
+
+			for s := range filteredMatches {
+				if futuresAccount.Available < 5 {
+					break
+				}
+				var nextBalance float64
+				if futuresAccount.Available > 5 {
+					nextBalance = 5.00
+					futuresAccount.Available -= 5
+				} else {
+					nextBalance = futuresAccount.Available.Float64()
+					futuresAccount.Available = 0
+				}
+
+				contract := currency.Pair{Base: filteredMatches[s].Base, Quote: filteredMatches[s].Quote}.Format(usdtmFuturesFormat)
+
+				switch {
+				case filteredMatches[s].Spread > 0 && filteredMatches[s].LastSpread > 0,
+					filteredMatches[s].Spread < 0 && filteredMatches[s].LastSpread > 0:
+					for c := range allPositions {
+						if allPositions[c].Contract == contract.String() && allPositions[c].Size > 0 {
+							err := ClosePosition(exch, contract, "close_long")
+							if err != nil {
+								log.Errorf(strategy, "failed to update positions: %v", err)
+								panic(err)
+							}
+						}
+					}
+					_, err = exch.SubmitOrder(context.Background(), &order.Submit{
+						Exchange:    exch.GetName(),
+						Pair:        contract,
+						TimeInForce: order.FillOrKill,
+						Type:        order.Market,
+						AssetType:   asset.USDTMarginedFutures,
+						Side:        order.Short,
+						Amount:      nextBalance,
+						Leverage:    1,
+					})
+					if err != nil {
+						log.Errorf(strategy, "error: %v", err)
+						// panic(err)
+					}
+					tradesPerHour += 1
+					// orderDetails = append(orderDetails, result)
+				case filteredMatches[s].Spread > 0 && filteredMatches[s].LastSpread < 0,
+					filteredMatches[s].Spread < 0 && filteredMatches[s].LastSpread < 0:
+					for c := range allPositions {
+						if allPositions[c].Contract == contract.String() && allPositions[c].Size < 0 {
+							err := ClosePosition(exch, contract, "close_short")
+							if err != nil {
+								log.Errorf(strategy, "failed to update positions: %v", err)
+								panic(err)
+							}
+						}
+					}
+					_, err := exch.SubmitOrder(context.Background(), &order.Submit{
+						Exchange:    exch.GetName(),
+						Pair:        currency.Pair{Base: filteredMatches[s].Base, Quote: filteredMatches[s].Quote},
+						TimeInForce: order.FillOrKill,
+						Type:        order.Market,
+						AssetType:   asset.USDTMarginedFutures,
+						Side:        order.Long,
+						Amount:      nextBalance,
+					})
+					if err != nil {
+						log.Errorf(strategy, "error: %v", err)
+						panic(err)
+					}
+					tradesPerHour += 1
+					// orderDetails = append(orderDetails, result)
+				}
+				// setting the leverages.
+				_, err = exch.UpdateFuturesPositionLeverage(context.Background(), settlement, contract, 1, 1)
+				if err != nil {
+					log.Errorf(strategy, "error: %v", err)
+					println("erro here: ", err.Error())
+					continue
+				}
+				// break
+			}
+		case <-twentySecondsTicker.C:
+			var err error
+			allPositions, err = exch.GetAllFuturesPositionsOfUsers(context.Background(), currency.USDT, true)
+			if err != nil {
+				log.Errorf(strategy, "failed to update positions: %v", err)
+				panic(err)
+			}
+
+			// Update stats for only open positions
+			for p := range allPositions {
+				err = UpdateStat(exch, selectedMatches, allPositions[p].Contract)
+				if err != nil {
+					log.Errorf(strategy, "failed to update positions: %v", err)
+					panic(err)
+				}
+			}
+
+			// Close positions if not eligible.
 			for p := range allPositions {
 				found := false
 				contract, err := currency.NewPairFromString(allPositions[p].Contract)
@@ -408,7 +456,9 @@ func RunGateIO(ctx context.Context, toggle *Toggle, exch *gateio.Exchange, logge
 					log.Errorf(strategy, "failed to update positions: %v", err)
 					continue
 				}
+
 				var autoSize string
+				contract = contract.Format(usdtmFuturesFormat)
 				if allPositions[p].Mode == "dual_long" {
 					autoSize = "close_long"
 				} else {
@@ -420,35 +470,16 @@ func RunGateIO(ctx context.Context, toggle *Toggle, exch *gateio.Exchange, logge
 					}
 					found = true
 					if !selectedMatches[s].Eligible {
-						_, err = exch.PlaceFuturesOrder(context.Background(), &gateio.ContractOrderCreateParams{
-							Contract:      contract,
-							Size:          0,
-							ClosePosition: false,
-							// IsClose:       true,
-							ReduceOnly:  true,
-							TimeInForce: "ioc",
-							Settle:      currency.USDT,
-							AutoSize:    autoSize,
-							// SelfTradePreventionAction: "",
-						})
+						err := ClosePosition(exch, contract, autoSize)
 						if err != nil {
 							log.Errorf(strategy, "failed to update positions: %v", err)
 							panic(err)
 						}
+						tradesPerHour += 1
 					}
 				}
 				if !found {
-					_, err = exch.PlaceFuturesOrder(context.Background(), &gateio.ContractOrderCreateParams{
-						Contract:      contract,
-						Size:          0,
-						ClosePosition: false,
-						// IsClose:       true,
-						ReduceOnly:  true,
-						TimeInForce: "ioc",
-						Settle:      currency.USDT,
-						AutoSize:    autoSize,
-						// SelfTradePreventionAction: "",
-					})
+					err := ClosePosition(exch, contract, autoSize)
 					if err != nil {
 						log.Errorf(strategy, "failed to update positions: %v", err)
 						panic(err)
@@ -458,6 +489,21 @@ func RunGateIO(ctx context.Context, toggle *Toggle, exch *gateio.Exchange, logge
 			}
 		}
 	}
+}
+
+func ClosePosition(exch *gateio.Exchange, contract currency.Pair, autoSize string) error {
+	_, err := exch.PlaceFuturesOrder(context.Background(), &gateio.ContractOrderCreateParams{
+		Contract:      contract,
+		Size:          0,
+		ClosePosition: false,
+		// IsClose:       true,
+		ReduceOnly:  true,
+		TimeInForce: "ioc",
+		Settle:      currency.USDT,
+		AutoSize:    autoSize,
+		// SelfTradePreventionAction: "",
+	})
+	return err
 }
 
 func SortMatches(matches []collections.MatchInfo, leng int) []collections.MatchInfo {
@@ -480,18 +526,47 @@ func SortMatches(matches []collections.MatchInfo, leng int) []collections.MatchI
 	return eligible[:leng]
 }
 
-func UpdateStat(exch *gateio.Exchange, matches []collections.MatchInfo) error {
+func UpdateStat(exch *gateio.Exchange, matches []collections.MatchInfo, contracts ...string) error {
 	for m := range matches {
-		sTicker, err := exch.UpdateTicker(context.Background(), currency.Pair{Base: matches[m].Base, Quote: matches[m].Quote}, asset.Spot)
+		if len(contracts) > 0 {
+			if !slices.Contains(contracts, matches[m].FutureSymbol) {
+				continue
+			}
+		}
+		sBooks, err := exch.GetOrderbook(context.Background(), matches[m].SpotSymbol, kline.OneHour.String(), 10, true)
 		if err != nil {
 			return err
 		}
-		fTicker, err := exch.UpdateTicker(context.Background(), currency.Pair{Base: matches[m].Base, Quote: matches[m].Quote}, asset.USDTMarginedFutures)
+		fBooks, err := exch.GetFuturesOrderbook(context.Background(), matches[m].Quote, matches[m].FutureSymbol, kline.OneHour.String(), 1, true)
 		if err != nil {
 			return err
 		}
-		matches[m].LastSpread = (fTicker.Last - sTicker.Last) / sTicker.Last
-		diff := math.Abs(matches[m].Spread - matches[m].LastSpread)
+		var sAverage float64
+		var sAverageSize float64
+		for a := range sBooks.Asks {
+			sAverage += sBooks.Asks[a].Price.Float64() * sBooks.Asks[a].Amount.Float64()
+			sAverageSize += sBooks.Asks[a].Amount.Float64()
+		}
+		for b := range sBooks.Bids {
+			sAverage += sBooks.Bids[b].Price.Float64() * sBooks.Bids[b].Amount.Float64()
+			sAverageSize += sBooks.Bids[b].Amount.Float64()
+		}
+		sAverage = sAverage / (float64(len(sBooks.Bids)+len(sBooks.Asks)) * sAverageSize)
+
+		var faverage float64
+		var faverageSize float64
+		for a := range fBooks.Asks {
+			faverage += fBooks.Asks[a].Price.Float64() * fBooks.Asks[a].Amount.Float64()
+			faverageSize += fBooks.Asks[a].Amount.Float64()
+		}
+		for b := range fBooks.Bids {
+			faverage += (fBooks.Bids[b].Price.Float64() * fBooks.Bids[b].Amount.Float64())
+			faverageSize += fBooks.Bids[b].Amount.Float64()
+		}
+		faverage = faverage / (float64(len(fBooks.Bids)+len(fBooks.Asks)) * faverageSize)
+		matches[m].LastSpread = (faverage - sAverage)
+
+		diff := matches[m].Spread - matches[m].LastSpread
 		matches[m].Eligible = diff > 0.005
 		matches[m].Diff = diff
 	}
@@ -547,6 +622,9 @@ func GetCandlesOfMatches(exch *gateio.Exchange, matches []collections.MatchInfo)
 			return err
 		} else if matches[i].FuturesCandles == nil {
 			panic("Nil pointer for matches[i].FuturesCandles")
+		}
+		if len(matches[i].FuturesCandles.Candles) < 100 {
+			continue
 		}
 		matches[i].SpotCandles, err = exch.GetHistoricCandles(context.Background(), currency.Pair{Base: matches[i].Base, Quote: matches[i].Quote}, asset.Spot, kline.OneHour, time.Now().Add(-200*time.Hour), time.Now())
 		if err != nil {
