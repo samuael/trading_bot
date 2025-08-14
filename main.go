@@ -36,7 +36,7 @@ func main() {
 
 	e.API.AuthenticatedSupport = true
 	e.API.AuthenticatedWebsocketSupport = true
-	e.SetCredentials("", "", "", "", "", "")
+	e.SetCredentials("1f5bfea0c030bb0271b1366ec6157418", "c2e108c330a40ccd86f1de594a65129047ab95a3c3dc3974952185f91ccbc5aa", "", "", "", "")
 
 	f, err := os.OpenFile("profit_log.csv", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
