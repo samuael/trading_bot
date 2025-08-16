@@ -139,6 +139,8 @@ func TestCancelOrder(t *testing.T) {
 	allPositions, err := e.(*gateio.Exchange).GetAllFuturesPositionsOfUsers(context.Background(), currency.USDT, true)
 	require.NoError(t, err)
 
+	println("Positions length: ", len(allPositions))
+
 	for p := range allPositions {
 		// println("Position with ID: ", allPositions[p].Contract, allPositions[p].Leverage)
 		contract, err := currency.NewPairFromString(allPositions[p].Contract)
@@ -172,4 +174,12 @@ func TestUpdateFuturesPositionLeverage(t *testing.T) {
 	position, err := e.(*gateio.Exchange).UpdateFuturesPositionLeverage(context.Background(), currency.USDT, currency.Pair{Base: currency.NewCode("SHM"), Quote: currency.USDT, Delimiter: currency.UnderscoreDelimiter}, 0, 1)
 	require.NoError(t, err)
 	assert.NotNil(t, position)
+}
+
+func TestGetFuturesOrderbook(t *testing.T) {
+	t.Parallel()
+	e.(*gateio.Exchange).Verbose = true
+	result, err := e.(*gateio.Exchange).GetOrderbook(context.Background(), "BTC_USDT", "", 10, false)
+	require.NoError(t, err)
+	assert.NotNil(t, result)
 }

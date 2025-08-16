@@ -36,13 +36,18 @@ func main() {
 
 	e.API.AuthenticatedSupport = true
 	e.API.AuthenticatedWebsocketSupport = true
-	e.SetCredentials("1f5bfea0c030bb0271b1366ec6157418", "c2e108c330a40ccd86f1de594a65129047ab95a3c3dc3974952185f91ccbc5aa", "", "", "", "")
+	e.SetCredentials("", "", "", "", "", "")
 
 	f, err := os.OpenFile("profit_log.csv", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer f.Close()
+	defer func() {
+		err := f.Close()
+		if err != nil {
+			println(err.Error())
+		}
+	}()
 
 	logger := log.New(f, "", log.LstdFlags)
 
@@ -57,15 +62,5 @@ func main() {
 func startMetricsServer() {
 	http.Handle("/metrics", promhttp.Handler())
 	log.Println("Prometheus metrics listening on :2112")
-	http.ListenAndServe(":2112", nil)
-}
-
-func loadInstruments() {
-	// file, err := os.Open("instruments.json")
-	// if err != nil {
-	// 	os.Exit(1)
-	// 	log.Fatal(err)
-	// }
-	// jsonFile := json.NewDecoder(file)
-	// jsonFile.Decode()
+	log.Fatal(http.ListenAndServe(":2112", nil))
 }
