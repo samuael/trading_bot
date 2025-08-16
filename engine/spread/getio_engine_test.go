@@ -179,7 +179,15 @@ func TestUpdateFuturesPositionLeverage(t *testing.T) {
 func TestGetFuturesOrderbook(t *testing.T) {
 	t.Parallel()
 	e.(*gateio.Exchange).Verbose = true
-	result, err := e.(*gateio.Exchange).GetOrderbook(context.Background(), "BTC_USDT", "", 10, false)
+	result, err := e.(*gateio.Exchange).GetFuturesOrderbook(context.Background(), currency.USDT, "BTC_USDT", "10", 10, false)
+	require.NoError(t, err)
+	assert.NotNil(t, result)
+}
+
+func TestGetOrderbook(t *testing.T) {
+	t.Parallel()
+	e.(*gateio.Exchange).Verbose = true
+	result, err := e.(*gateio.Exchange).GetOrderbook(context.Background(), "BTC_USDT", "", 0, false)
 	require.NoError(t, err)
 	assert.NotNil(t, result)
 }

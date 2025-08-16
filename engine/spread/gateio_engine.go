@@ -427,16 +427,11 @@ func UpdateStat(exch *gateio.Exchange, matches []collections.MatchInfo, settleme
 				continue
 			}
 		}
-		intervalString, err := gateio.GetIntervalString(kline.ThirtyMin)
+		sBooks, err := exch.GetOrderbook(context.Background(), matches[m].SpotSymbol, "", 0, true)
 		if err != nil {
 			return err
 		}
-		sBooks, err := exch.GetOrderbook(context.Background(), matches[m].SpotSymbol, intervalString, 10, true)
-		if err != nil {
-			return err
-		}
-		exch.Verbose = true
-		fBooks, err := exch.GetFuturesOrderbook(context.Background(), settlementCcy, matches[m].FutureSymbol, intervalString, 1, true)
+		fBooks, err := exch.GetFuturesOrderbook(context.Background(), settlementCcy, matches[m].FutureSymbol, "", 0, true)
 		if err != nil {
 			return err
 		}

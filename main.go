@@ -10,6 +10,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/samuael/trading_bot/engine/spread"
+	"github.com/thrasher-corp/gocryptotrader/exchanges/asset"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/gateio"
 )
 
@@ -37,6 +38,11 @@ func main() {
 	e.API.AuthenticatedSupport = true
 	e.API.AuthenticatedWebsocketSupport = true
 	e.SetCredentials("", "", "", "", "", "")
+
+	err = e.ValidateAPICredentials(context.Background(), asset.Spot)
+	if err != nil {
+		panic(err)
+	}
 
 	f, err := os.OpenFile("profit_log.csv", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
