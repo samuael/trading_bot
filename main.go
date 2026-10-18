@@ -2,10 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
+	"flag"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
-	"sync"
+	"os/signal"
+	"syscall"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -14,59 +18,64 @@ import (
 	"github.com/thrasher-corp/gocryptotrader/exchanges/gateio"
 )
 
-var (
-	strategyBalance = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "bot_strategy_total_balance_usd",
-			Help: "Total balance per strategy in USD",
-		},
-		[]string{"strategy"}, // <-- label for your strategy name
-	)
-)
-
-func init() {
-	prometheus.MustRegister(strategyBalance)
-}
-
 func main() {
-	e := new(gateio.Exchange)
-	err := spread.Setup(e, "config_example.json")
+	exchangeConfig := flag.String("exchange-config", "config_example.json", "gocryptotrader config holding the GateIO exchange settings")
+	strategyConfig := flag.String("strategy-config", "strategy.json", "strategy parameters; defaults are used for missing fields")
+	metricsAddr := flag.String("metrics-addr", ":2112", "address serving Prometheus metrics")
+	verbose := flag.Bool("v", false, "log rejected candidates and other debug detail")
+	flag.Parse()
+
+	level := slog.LevelInfo
+	if *verbose {
+		level = slog.LevelDebug
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+
+	cfg, err := spread.LoadConfig(*strategyConfig)
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	apiKey, apiSecret := os.Getenv("GATEIO_API_KEY"), os.Getenv("GATEIO_API_SECRET")
+	if apiKey == "" || apiSecret == "" {
+		log.Fatal("GATEIO_API_KEY and GATEIO_API_SECRET must be set")
+	}
+
+	e := new(gateio.Exchange)
+	if err := spread.Setup(e, *exchangeConfig); err != nil {
+		log.Fatal(err)
+	}
 	e.API.AuthenticatedSupport = true
 	e.API.AuthenticatedWebsocketSupport = true
-	e.SetCredentials("", "", "", "", "", "")
+	e.SetCredentials(apiKey, apiSecret, "", "", "", "")
 
-	err = e.ValidateAPICredentials(context.Background(), asset.Spot)
-	if err != nil {
-		panic(err)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := e.ValidateAPICredentials(ctx, asset.Spot); err != nil {
+		log.Fatal(err)
 	}
 
-	f, err := os.OpenFile("profit_log.csv", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile("profit_log.csv", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer func() {
-		err := f.Close()
-		if err != nil {
-			println(err.Error())
-		}
-	}()
+	defer f.Close()
 
-	logger := log.New(f, "", log.LstdFlags)
+	metrics := spread.NewMetrics(prometheus.DefaultRegisterer)
+	go startMetricsServer(*metricsAddr)
 
-	go startMetricsServer()
-
-	wg := new(sync.WaitGroup)
-	wg.Add(1)
-	go spread.RunGateIO(context.Background(), &spread.Toggle{}, e, logger, strategyBalance, wg)
-	wg.Wait()
+	engine, err := spread.NewEngine(cfg, spread.NewGateIOClient(e), logger, metrics, log.New(f, "", log.LstdFlags))
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := engine.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		log.Fatal(err)
+	}
 }
 
-func startMetricsServer() {
+func startMetricsServer(addr string) {
 	http.Handle("/metrics", promhttp.Handler())
-	log.Println("Prometheus metrics listening on :2112")
-	log.Fatal(http.ListenAndServe(":2112", nil))
+	log.Println("Prometheus metrics listening on", addr)
+	log.Fatal(http.ListenAndServe(addr, nil))
 }

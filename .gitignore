@@ -1,1 +1,6 @@
-./history
+trading_bot
+.history/
+.DS_Store
+positions.json
+positions.json.tmp
+trades.csv
