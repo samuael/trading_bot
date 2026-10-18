@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -21,8 +22,10 @@ import (
 func main() {
 	exchangeConfig := flag.String("exchange-config", "config_example.json", "gocryptotrader config holding the GateIO exchange settings")
 	strategyConfig := flag.String("strategy-config", "strategy.json", "strategy parameters; defaults are used for missing fields")
-	metricsAddr := flag.String("metrics-addr", ":2112", "address serving Prometheus metrics")
+	metricsAddr := flag.String("metrics-addr", ":2113", "address serving Prometheus metrics")
+	profitLog := flag.String("profit-log", "profit_log.csv", "file receiving a total balance line every balance_log_minutes")
 	verbose := flag.Bool("v", false, "log rejected candidates and other debug detail")
+	httpTimeout := flag.Duration("http-timeout", time.Minute, "REST request timeout; full market lists are several MB")
 	flag.Parse()
 
 	level := slog.LevelInfo
@@ -48,6 +51,9 @@ func main() {
 	e.API.AuthenticatedSupport = true
 	e.API.AuthenticatedWebsocketSupport = true
 	e.SetCredentials(apiKey, apiSecret, "", "", "", "")
+	if err := e.SetHTTPClientTimeout(*httpTimeout); err != nil {
+		log.Fatal(err)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -56,7 +62,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	f, err := os.OpenFile("profit_log.csv", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(*profitLog, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -65,7 +71,15 @@ func main() {
 	metrics := spread.NewMetrics(prometheus.DefaultRegisterer)
 	go startMetricsServer(*metricsAddr)
 
-	engine, err := spread.NewEngine(cfg, spread.NewGateIOClient(e), logger, metrics, log.New(f, "", log.LstdFlags))
+	client := spread.NewGateIOClient(e, *httpTimeout)
+	var market spread.MarketData // nil serves market data from REST
+	if cfg.UseWebsocket {
+		feed := spread.NewFeed(client, cfg, logger, metrics)
+		go feed.Run(ctx)
+		market = feed
+	}
+
+	engine, err := spread.NewEngine(cfg, client, market, logger, metrics, log.New(f, "", log.LstdFlags))
 	if err != nil {
 		log.Fatal(err)
 	}

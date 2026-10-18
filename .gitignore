@@ -1,6 +1,8 @@
 trading_bot
 .history/
 .DS_Store
+.env
 positions.json
 positions.json.tmp
 trades.csv
+data/

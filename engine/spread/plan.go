@@ -14,36 +14,67 @@ var (
 	errNetTooSmall    = errors.New("expected net profit below minimum")
 )
 
-// EntryPlan is a sized, priced cash and carry entry: buy spot, short the perpetual.
-type EntryPlan struct {
-	Inst Instrument
-	Fees Fees
+// Direction is which side of the spot/perp spread a position is on.
+type Direction string
 
-	Contracts float64 // perp contracts to short
-	SpotQty   float64 // base to buy, including an allowance for a fee deducted in base
+const (
+	// Carry buys spot and shorts the perp, earning the premium when the perp trades above spot.
+	Carry Direction = "carry"
+	// Reverse sells spot borrowed on isolated margin and longs the perp, earning the discount when the perp trades
+	// below spot.
+	Reverse Direction = "reverse"
+)
+
+// spreadOf is the executable spread in the direction's favour, as a fraction of the spot price.
+func spreadOf(dir Direction, spotPrice, futuresPrice float64) float64 {
+	if dir == Reverse {
+		return -basis(futuresPrice, spotPrice)
+	}
+	return basis(futuresPrice, spotPrice)
+}
+
+// EntryPlan is a sized, priced entry. Carry buys spot and shorts the perp; reverse sells borrowed spot and longs
+// the perp.
+type EntryPlan struct {
+	Direction Direction
+	Inst      Instrument
+	Fees      Fees
+
+	Contracts float64 // perp contracts to trade
+	SpotQty   float64 // base to trade; carry buys include an allowance for a fee deducted in base
 
 	SpotVWAP     float64
 	FuturesVWAP  float64
-	SpotLimit    float64 // IOC limit for the spot buy
-	FuturesLimit float64 // IOC limit for the perp sell
+	SpotLimit    float64 // IOC limit for the spot leg
+	FuturesLimit float64 // IOC limit for the perp leg
 
-	Basis       float64 // gross executable entry basis
-	ExpectedNet float64 // Basis less exit target and round trip fees
-	Notional    float64 // USDT spent on the spot leg
+	Basis        float64 // gross executable entry spread in the direction's favour
+	InterestCost float64 // expected borrow interest over cfg.ExpectedHoldHours, reverse only
+	ExpectedNet  float64 // Basis less exit target, round trip fees and interest
+	Notional     float64 // USDT value of the spot leg
 }
 
 // planEntry sizes a position within budget (USDT) and the liquidity available within cfg.MaxSlippage, then
-// accepts it only when the gross basis reaches cfg.MinEntrySpread and the return after round trip fees, assuming
-// an exit at cfg.ExitSpread, reaches cfg.MinNetProfit.
-func planEntry(inst Instrument, spotAsks, futuresBids []Level, fees Fees, budget float64, cfg Config) (EntryPlan, error) {
-	plan := EntryPlan{Inst: inst, Fees: fees}
-	if len(spotAsks) == 0 || len(futuresBids) == 0 || inst.Multiplier <= 0 {
+// accepts it only when the gross spread reaches cfg.MinEntrySpread and the return after round trip fees and
+// expected borrow interest, assuming an exit at cfg.ExitSpread, reaches cfg.MinNetProfit.
+//
+// spotBook and futuresBook are the sides the entry trades against: spot asks and perp bids for carry, spot bids
+// and perp asks for reverse. hourlyBorrowRate only applies to reverse.
+func planEntry(dir Direction, inst Instrument, spotBook, futuresBook []Level, fees Fees, hourlyBorrowRate, budget float64, cfg Config) (EntryPlan, error) {
+	plan := EntryPlan{Direction: dir, Inst: inst, Fees: fees}
+	if len(spotBook) == 0 || len(futuresBook) == 0 || inst.Multiplier <= 0 {
 		return plan, errNoLiquidity
 	}
+	carry := dir == Carry
 
-	base := budget * (1 - fees.SpotTaker) / spotAsks[0].Price
-	base = min(base, depthWithin(spotAsks, cfg.MaxSlippage, true)*(1-fees.SpotTaker))
-	base = min(base, depthWithin(futuresBids, cfg.MaxSlippage, false)*inst.Multiplier)
+	// A carry buy loses its fee in base, so less base is bought per USDT.
+	feeAdjust := 1.0
+	if carry {
+		feeAdjust = 1 - fees.SpotTaker
+	}
+	base := budget * feeAdjust / spotBook[0].Price
+	base = min(base, depthWithin(spotBook, cfg.MaxSlippage, carry)*feeAdjust)
+	base = min(base, depthWithin(futuresBook, cfg.MaxSlippage, !carry)*inst.Multiplier)
 
 	contracts := math.Floor(base/inst.Multiplier + epsilon)
 	if inst.MaxContracts > 0 {
@@ -53,10 +84,13 @@ func planEntry(inst Instrument, spotAsks, futuresBids []Level, fees Fees, budget
 		return plan, errBelowMinSize
 	}
 
-	// Buy enough spot that the base left after a fee deducted in base still covers the perp short.
-	spotQty := grossSpotQty(contracts*inst.Multiplier, fees, inst)
-	spot := walkBook(spotAsks, spotQty)
-	fut := walkBook(futuresBids, contracts)
+	spotQty := ceilTo(contracts*inst.Multiplier, inst.SpotAmountPrecision)
+	if carry {
+		// Buy enough spot that the base left after a fee deducted in base still covers the perp short.
+		spotQty = grossSpotQty(contracts*inst.Multiplier, fees, inst)
+	}
+	spot := walkBook(spotBook, spotQty)
+	fut := walkBook(futuresBook, contracts)
 	if spot.Qty < spotQty-epsilon || fut.Qty < contracts-epsilon {
 		return plan, errNoLiquidity
 	}
@@ -66,12 +100,20 @@ func planEntry(inst Instrument, spotAsks, futuresBids []Level, fees Fees, budget
 	plan.SpotVWAP = spot.VWAP
 	plan.FuturesVWAP = fut.VWAP
 	plan.Notional = spotQty * spot.VWAP
-	if spotQty < inst.SpotMinBase || plan.Notional < inst.SpotMinQuote || plan.Notional < cfg.MinTradeNotional {
+	// Rounding down to whole contracts may leave a minimum sized budget up to one contract short of the minimum.
+	contractValue := inst.Multiplier * spot.VWAP
+	if spotQty < inst.SpotMinBase || plan.Notional < inst.SpotMinQuote || plan.Notional+contractValue < cfg.MinTradeNotional {
+		return plan, errBelowMinSize
+	}
+	if !carry && spotQty < inst.MinBorrow {
 		return plan, errBelowMinSize
 	}
 
-	plan.Basis = basis(fut.VWAP, spot.VWAP)
-	plan.ExpectedNet = expectedNetReturn(plan.Basis, cfg.ExitSpread, fees)
+	plan.Basis = spreadOf(dir, spot.VWAP, fut.VWAP)
+	if !carry {
+		plan.InterestCost = hourlyBorrowRate * cfg.ExpectedHoldHours
+	}
+	plan.ExpectedNet = expectedNetReturn(plan.Basis, cfg.ExitSpread, fees) - plan.InterestCost
 	if plan.Basis < cfg.MinEntrySpread {
 		return plan, fmt.Errorf("%w: %.4f%% < %.4f%%", errSpreadTooSmall, plan.Basis*100, cfg.MinEntrySpread*100)
 	}
@@ -79,16 +121,22 @@ func planEntry(inst Instrument, spotAsks, futuresBids []Level, fees Fees, budget
 		return plan, fmt.Errorf("%w: %.4f%% > %.4f%%", errSpreadTooLarge, plan.Basis*100, cfg.MaxEntrySpread*100)
 	}
 	if plan.ExpectedNet < cfg.MinNetProfit {
-		return plan, fmt.Errorf("%w: %.4f%% < %.4f%% (round trip fees %.4f%%)", errNetTooSmall, plan.ExpectedNet*100, cfg.MinNetProfit*100, fees.RoundTrip()*100)
+		return plan, fmt.Errorf("%w: %.4f%% < %.4f%% (round trip fees %.4f%%, interest %.4f%%)",
+			errNetTooSmall, plan.ExpectedNet*100, cfg.MinNetProfit*100, fees.RoundTrip()*100, plan.InterestCost*100)
 	}
 
 	// The perp leg goes first and must not fill worse than planned; the spot leg hedges it and gets an allowance.
-	plan.FuturesLimit = floorToStep(fut.Worst, inst.PriceTick)
-	plan.SpotLimit = ceilTo(spot.Worst*(1+cfg.HedgeSlippage), inst.SpotPricePrecision)
+	if carry {
+		plan.FuturesLimit = floorToStep(fut.Worst, inst.PriceTick)
+		plan.SpotLimit = ceilTo(spot.Worst*(1+cfg.HedgeSlippage), inst.SpotPricePrecision)
+	} else {
+		plan.FuturesLimit = ceilToStep(fut.Worst, inst.PriceTick)
+		plan.SpotLimit = floorTo(spot.Worst*(1-cfg.HedgeSlippage), inst.SpotPricePrecision)
+	}
 	return plan, nil
 }
 
-// ExitPlan prices closing what remains of a position: sell spot, buy back the perpetual.
+// ExitPlan prices closing what remains of a position.
 type ExitPlan struct {
 	Contracts float64
 	SpotQty   float64
@@ -98,29 +146,43 @@ type ExitPlan struct {
 	SpotLimit    float64
 	FuturesLimit float64
 
-	// Basis is the executable exit basis. It is only meaningful while contracts remain.
+	// Basis is the executable exit spread in the position's favour. It is only meaningful while contracts remain.
 	Basis float64
 }
 
-// planExit prices the remaining contracts and spot holding against the current books.
-func planExit(inst Instrument, contracts, spotHeld float64, spotBids, futuresAsks []Level, cfg Config) (ExitPlan, error) {
-	plan := ExitPlan{Contracts: contracts, SpotQty: floorTo(spotHeld, inst.SpotAmountPrecision)}
-	if len(spotBids) == 0 || (contracts > 0 && len(futuresAsks) == 0) {
+// planExit prices the remaining contracts and spot exposure against the current books. spotBook and futuresBook
+// are the sides the exit trades against: spot bids and perp asks for carry, spot asks and perp bids for reverse.
+// For reverse, spotQty is the base to buy back.
+func planExit(dir Direction, inst Instrument, contracts, spotQty float64, spotBook, futuresBook []Level, cfg Config) (ExitPlan, error) {
+	carry := dir == Carry
+	plan := ExitPlan{Contracts: contracts, SpotQty: floorTo(spotQty, inst.SpotAmountPrecision)}
+	if !carry {
+		plan.SpotQty = ceilTo(spotQty, inst.SpotAmountPrecision)
+	}
+	if len(spotBook) == 0 || (contracts > 0 && len(futuresBook) == 0) {
 		return plan, errNoLiquidity
 	}
 
-	spot := walkBook(spotBids, plan.SpotQty)
+	spot := walkBook(spotBook, plan.SpotQty)
 	if spot.Qty == 0 {
-		spot = bookFill{VWAP: spotBids[0].Price, Worst: spotBids[0].Price}
+		spot = bookFill{VWAP: spotBook[0].Price, Worst: spotBook[0].Price}
 	}
 	plan.SpotVWAP = spot.VWAP
-	plan.SpotLimit = floorTo(spot.Worst*(1-cfg.ExitSlippage), inst.SpotPricePrecision)
+	if carry {
+		plan.SpotLimit = floorTo(spot.Worst*(1-cfg.ExitSlippage), inst.SpotPricePrecision)
+	} else {
+		plan.SpotLimit = ceilTo(spot.Worst*(1+cfg.ExitSlippage), inst.SpotPricePrecision)
+	}
 
 	if contracts > 0 {
-		fut := walkBook(futuresAsks, contracts)
+		fut := walkBook(futuresBook, contracts)
 		plan.FuturesVWAP = fut.VWAP
-		plan.FuturesLimit = ceilToStep(fut.Worst*(1+cfg.ExitSlippage), inst.PriceTick)
-		plan.Basis = basis(fut.VWAP, spot.VWAP)
+		if carry {
+			plan.FuturesLimit = ceilToStep(fut.Worst*(1+cfg.ExitSlippage), inst.PriceTick)
+		} else {
+			plan.FuturesLimit = floorToStep(fut.Worst*(1-cfg.ExitSlippage), inst.PriceTick)
+		}
+		plan.Basis = spreadOf(dir, spot.VWAP, fut.VWAP)
 	}
 	return plan, nil
 }

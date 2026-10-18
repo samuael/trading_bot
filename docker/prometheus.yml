@@ -1,0 +1,7 @@
+# Prometheus config for docker-compose: scrapes the bot service by name.
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: 'strategy'
+    static_configs:
+      - targets: ['bot:2113']

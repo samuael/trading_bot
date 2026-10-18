@@ -26,6 +26,22 @@ type Config struct {
 	// MinNetProfit is the minimum expected return after round trip taker fees, assuming exit at ExitSpread.
 	MinNetProfit float64 `json:"min_net_profit"`
 
+	// EnableReverse also trades a perp below spot: sell spot borrowed on isolated margin and long the perp.
+	EnableReverse bool `json:"enable_reverse"`
+	// MarginCollateralRatio is the USDT collateral placed in the isolated margin account per unit of notional
+	// borrowed. 0.5 keeps the margin account safe until the price rises about 35%.
+	MarginCollateralRatio float64 `json:"margin_collateral_ratio"`
+	// MarginRiskFloor closes a reverse position when the margin account risk ratio (assets / liabilities) falls
+	// below it. GateIO liquidates at 1.1.
+	MarginRiskFloor float64 `json:"margin_risk_floor"`
+	// ExpectedHoldHours prices borrow interest into reverse entries.
+	ExpectedHoldHours float64 `json:"expected_hold_hours"`
+
+	// UseWebsocket streams tickers and orderbooks, falling back to REST whenever the stream cannot serve a request.
+	UseWebsocket bool `json:"use_websocket"`
+	// WSBookMaxAgeSeconds is the oldest streamed book served before falling back to REST.
+	WSBookMaxAgeSeconds int `json:"ws_book_max_age_seconds"`
+
 	// MaxOpenPositions caps concurrently held spot/perp pairs.
 	MaxOpenPositions int `json:"max_open_positions"`
 	// MinTradeNotional is the smallest position (USDT) worth opening.
@@ -46,7 +62,8 @@ type Config struct {
 	// LiquidationBuffer force closes a position when the mark price is within this fraction of the liquidation price.
 	LiquidationBuffer float64 `json:"liquidation_buffer"`
 
-	// MinFundingRate skips contracts whose current funding rate is below it (a short pays funding when negative).
+	// MinFundingRate skips contracts whose current funding rate, signed in the position's favour, is below it: a
+	// carry short receives positive funding, a reverse long receives negative funding.
 	MinFundingRate float64 `json:"min_funding_rate"`
 	// MinSpotVolume24h and MinFuturesVolume24h filter out illiquid markets (quote volume, USDT).
 	MinSpotVolume24h    float64 `json:"min_spot_volume_24h"`
@@ -75,6 +92,12 @@ func DefaultConfig() Config {
 		MaxIndexDeviation:      0.005,
 		ExitSpread:             0.001,
 		MinNetProfit:           0.001,
+		EnableReverse:          true,
+		MarginCollateralRatio:  0.5,
+		MarginRiskFloor:        1.3,
+		ExpectedHoldHours:      24,
+		UseWebsocket:           true,
+		WSBookMaxAgeSeconds:    30,
 		MaxOpenPositions:       10,
 		MinTradeNotional:       5,
 		FuturesMarginReserve:   0.1,
@@ -127,6 +150,20 @@ func (c Config) Validate() error {
 	}
 	if c.ExitSpread >= c.MinEntrySpread {
 		errs = append(errs, errors.New("exit_spread must be below min_entry_spread"))
+	}
+	if c.EnableReverse {
+		if c.MarginCollateralRatio < 0.2 {
+			errs = append(errs, errors.New("margin_collateral_ratio must be at least 0.2"))
+		}
+		if c.MarginRiskFloor <= 1.1 {
+			errs = append(errs, errors.New("margin_risk_floor must be above GateIO's 1.1 liquidation level"))
+		}
+		if c.ExpectedHoldHours <= 0 {
+			errs = append(errs, errors.New("expected_hold_hours must be positive"))
+		}
+	}
+	if c.UseWebsocket && c.WSBookMaxAgeSeconds <= 0 {
+		errs = append(errs, errors.New("ws_book_max_age_seconds must be positive"))
 	}
 	if c.MaxOpenPositions <= 0 {
 		errs = append(errs, errors.New("max_open_positions must be positive"))

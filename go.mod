@@ -3,6 +3,7 @@ module github.com/samuael/trading_bot
 go 1.26.0
 
 require (
+	github.com/gorilla/websocket v1.5.3
 	github.com/prometheus/client_golang v1.23.0
 	github.com/stretchr/testify v1.11.1
 	github.com/thrasher-corp/gocryptotrader v0.0.0-20251119022136-7f1bbfc48cf2
@@ -25,9 +26,9 @@ require (
 	github.com/friendsofgo/errors v0.9.2 // indirect
 	github.com/gofrs/uuid v4.4.0+incompatible // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/huandu/xstrings v1.5.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.9 // indirect
+	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/mitchellh/copystructure v1.2.0 // indirect
 	github.com/mitchellh/reflectwalk v1.0.2 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect

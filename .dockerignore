@@ -1,0 +1,13 @@
+# Secrets and runtime state never enter the build context.
+.env
+positions.json
+positions.json.tmp
+trades.csv
+profit_log.csv
+data/
+
+# Build output and editor/VCS noise.
+trading_bot
+.git
+.history/
+.DS_Store

@@ -17,8 +17,13 @@ func usdtPair(base string) currency.Pair {
 	return currency.NewPairWithDelimiter(strings.ToUpper(base), settlement.String(), currency.UnderscoreDelimiter)
 }
 
-// buildUniverse joins tradable USDT spot pairs with live USDT margined perpetuals of the same base.
-func buildUniverse(spotPairs []gateio.CurrencyPairDetail, contracts []gateio.FuturesContract) map[string]Instrument {
+// buildUniverse joins tradable USDT spot pairs with live USDT margined perpetuals of the same base, and marks the
+// pairs that support isolated margin borrowing.
+func buildUniverse(spotPairs []gateio.CurrencyPairDetail, contracts []gateio.FuturesContract, marginPairs []MarginPair) map[string]Instrument {
+	margin := make(map[string]MarginPair, len(marginPairs))
+	for _, m := range marginPairs {
+		margin[m.Pair] = m
+	}
 	spotByBase := make(map[string]gateio.CurrencyPairDetail)
 	for _, sp := range spotPairs {
 		if !sp.Quote.Equal(settlement) ||
@@ -60,6 +65,10 @@ func buildUniverse(spotPairs []gateio.CurrencyPairDetail, contracts []gateio.Fut
 			SpotMinBase:         sp.MinBaseAmount.Float64(),
 			SpotMinQuote:        sp.MinQuoteAmount.Float64(),
 		}
+		if m, ok := margin[inst.SpotPair.String()]; ok {
+			inst.MarginEnabled = true
+			inst.MinBorrow = m.MinBorrow
+		}
 		universe[inst.Key()] = inst
 	}
 	return universe
@@ -67,11 +76,13 @@ func buildUniverse(spotPairs []gateio.CurrencyPairDetail, contracts []gateio.Fut
 
 type candidate struct {
 	inst        Instrument
+	dir         Direction
 	tickerBasis float64
 }
 
 // rankCandidates uses one spot and one futures ticker snapshot to shortlist instruments worth an orderbook check,
-// best ticker basis first. skip excludes instruments already held or blocked.
+// best ticker spread first. Carry candidates trade a perp above spot; reverse candidates, when enabled, a perp
+// below spot on a margin enabled pair. skip excludes instruments already held or blocked.
 func rankCandidates(universe map[string]Instrument, spot []gateio.Ticker, futures []gateio.FuturesTicker, cfg Config, skip func(key string) bool) []candidate {
 	spotByPair := make(map[string]gateio.Ticker, len(spot))
 	for _, t := range spot {
@@ -89,8 +100,8 @@ func rankCandidates(universe map[string]Instrument, spot []gateio.Ticker, future
 		if !ok {
 			continue
 		}
-		ask, last := st.LowestAsk.Float64(), ft.Last.Float64()
-		if ask <= 0 || last <= 0 {
+		ask, bid, last := st.LowestAsk.Float64(), st.HighestBid.Float64(), ft.Last.Float64()
+		if ask <= 0 || bid <= 0 || last <= 0 {
 			continue
 		}
 		futuresVolume := ft.Volume24HQuote.Float64()
@@ -100,22 +111,24 @@ func rankCandidates(universe map[string]Instrument, spot []gateio.Ticker, future
 		if st.QuoteVolume.Float64() < cfg.MinSpotVolume24h || futuresVolume < cfg.MinFuturesVolume24h {
 			continue
 		}
-		if ft.FundingRate.Float64() < cfg.MinFundingRate {
-			continue
-		}
-		b := basis(last, ask)
-		if b < cfg.MinEntrySpread*prefilterFactor || b > cfg.MaxEntrySpread {
-			continue
-		}
 		// A perp whose index does not track this spot market references a different asset with the same ticker.
-		mid := ask
-		if bid := st.HighestBid.Float64(); bid > 0 {
-			mid = (ask + bid) / 2
-		}
+		mid := (ask + bid) / 2
 		if index := ft.IndexPrice.Float64(); index <= 0 || math.Abs(index-mid)/mid > cfg.MaxIndexDeviation {
 			continue
 		}
-		out = append(out, candidate{inst: inst, tickerBasis: b})
+
+		c := candidate{inst: inst, dir: Carry, tickerBasis: basis(last, ask)}
+		funding := ft.FundingRate.Float64()
+		if cfg.EnableReverse && inst.MarginEnabled {
+			if reverse := spreadOf(Reverse, bid, last); reverse > c.tickerBasis {
+				c = candidate{inst: inst, dir: Reverse, tickerBasis: reverse}
+				funding = -funding
+			}
+		}
+		if c.tickerBasis < cfg.MinEntrySpread*prefilterFactor || c.tickerBasis > cfg.MaxEntrySpread || funding < cfg.MinFundingRate {
+			continue
+		}
+		out = append(out, c)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].tickerBasis > out[j].tickerBasis })
 	if len(out) > cfg.MaxCandidates {

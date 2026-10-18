@@ -28,6 +28,10 @@ type Instrument struct {
 	SpotPricePrecision  int     `json:"spot_price_precision"`
 	SpotMinBase         float64 `json:"spot_min_base"`
 	SpotMinQuote        float64 `json:"spot_min_quote"`
+
+	// MarginEnabled is set when the spot pair supports isolated margin borrowing, which reverse positions need.
+	MarginEnabled bool    `json:"margin_enabled,omitempty"`
+	MinBorrow     float64 `json:"min_borrow,omitempty"`
 }
 
 // Key identifies the instrument, e.g. "BTC_USDT".

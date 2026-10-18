@@ -22,10 +22,12 @@ const (
 // Position is one hedged spot/perp pair. It accumulates every fill so that realised profit reflects the prices,
 // fees and funding actually received, including partial fills and hedge corrections.
 type Position struct {
-	ID       string     `json:"id"`
-	Inst     Instrument `json:"instrument"`
-	State    string     `json:"state"`
-	OpenedAt time.Time  `json:"opened_at"`
+	ID string `json:"id"`
+	// Direction is empty in positions persisted before reverse trading existed; those are carry positions.
+	Direction Direction  `json:"direction,omitempty"`
+	Inst      Instrument `json:"instrument"`
+	State     string     `json:"state"`
+	OpenedAt  time.Time  `json:"opened_at"`
 
 	EntryBasis  float64 `json:"entry_basis"`
 	ExpectedNet float64 `json:"expected_net"`
@@ -48,13 +50,19 @@ type Position struct {
 	ContractsBought float64 `json:"contracts_bought"`
 	FutBuyNotional  float64 `json:"fut_buy_notional"`
 	FutFees         float64 `json:"fut_fees"`
-	// Funding is the funding received (positive) or paid (negative) by the perp short, as reported by the exchange.
+	// Funding is the funding received (positive) or paid (negative) by the perp leg, as reported by the exchange.
 	Funding float64 `json:"funding"`
+
+	// Reverse positions borrow the base they sell. InterestBase is interest accrued and still owed, InterestPaid is
+	// interest already repaid, both in base as reported by the margin account.
+	InterestBase float64 `json:"interest_base,omitempty"`
+	InterestPaid float64 `json:"interest_paid,omitempty"`
 }
 
 func newPosition(plan EntryPlan, now time.Time) *Position {
 	return &Position{
 		ID:          plan.Inst.Key() + "-" + strconv.FormatInt(now.UnixMilli(), 10),
+		Direction:   plan.Direction,
 		Inst:        plan.Inst,
 		State:       stateOpen,
 		OpenedAt:    now,
@@ -63,21 +71,44 @@ func newPosition(plan EntryPlan, now time.Time) *Position {
 	}
 }
 
-// OpenContracts is the size of the perp short still held.
-func (p *Position) OpenContracts() float64 { return p.ContractsSold - p.ContractsBought }
-
-// SpotHeld is the base still held.
-func (p *Position) SpotHeld() float64 { return p.SpotBought - p.SpotSold }
-
-// hedgeTolerance treats a spot holding within 1% of a contract as covering it, absorbing fee rounding.
-const hedgeTolerance = 0.01
-
-// HedgedContracts is the number of contracts the current spot holding covers.
-func (p *Position) HedgedContracts() float64 {
-	return math.Floor(p.SpotHeld()/p.Inst.Multiplier + hedgeTolerance)
+// Dir is the position's direction.
+func (p *Position) Dir() Direction {
+	if p.Direction == Reverse {
+		return Reverse
+	}
+	return Carry
 }
 
-// RealizedPnL is the USDT profit of everything traded so far.
+// OpenContracts is the size of the perp leg still held: a short for carry, a long for reverse.
+func (p *Position) OpenContracts() float64 {
+	if p.Dir() == Reverse {
+		return p.ContractsBought - p.ContractsSold
+	}
+	return p.ContractsSold - p.ContractsBought
+}
+
+// SpotExposure is the base the perp leg hedges: the base held for carry, and for reverse the base still owed to the
+// margin account (borrowed plus interest) less the base already bought back.
+func (p *Position) SpotExposure() float64 {
+	if p.Dir() == Reverse {
+		return p.SpotSold + p.InterestPaid + p.InterestBase - p.SpotBought
+	}
+	return p.SpotBought - p.SpotSold
+}
+
+// hedgeTolerance treats spot exposure within 1% of a contract as covering it, absorbing fee rounding.
+const hedgeTolerance = 0.01
+
+// HedgedContracts is the number of contracts the current spot exposure covers.
+func (p *Position) HedgedContracts() float64 {
+	return math.Floor(p.SpotExposure()/p.Inst.Multiplier + hedgeTolerance)
+}
+
+// perpIsShort reports whether the perp leg is a short.
+func (p *Position) perpIsShort() bool { return p.Dir() == Carry }
+
+// RealizedPnL is the USDT profit of everything traded so far. Reverse interest is included because the base
+// bought to repay it is part of SpotCost.
 func (p *Position) RealizedPnL() float64 {
 	return p.SpotProceeds - p.SpotCost + p.FutSellNotional - p.FutBuyNotional - p.FutFees - p.SpotFeesExternal + p.Funding
 }
@@ -167,9 +198,9 @@ func (s Store) SavePositions(positions map[string]*Position) error {
 }
 
 var ledgerHeader = []string{
-	"closed_at", "id", "instrument", "opened_at", "close_reason", "contracts", "spot_bought", "spot_sold",
-	"entry_basis", "expected_net", "exit_basis", "spot_cost", "spot_proceeds", "fut_sell_notional",
-	"fut_buy_notional", "spot_fees", "fut_fees", "funding", "net_pnl", "net_return",
+	"closed_at", "id", "direction", "instrument", "opened_at", "close_reason", "contracts", "spot_bought",
+	"spot_sold", "entry_basis", "expected_net", "exit_basis", "spot_cost", "spot_proceeds", "fut_sell_notional",
+	"fut_buy_notional", "spot_fees", "fut_fees", "funding", "interest_base", "net_pnl", "net_return",
 }
 
 // AppendLedger writes one CSV row describing a closed position.
@@ -193,14 +224,15 @@ func AppendLedger(path string, p *Position, closedAt time.Time) error {
 	}
 	num := func(v float64) string { return strconv.FormatFloat(v, 'f', 8, 64) }
 	netReturn := 0.0
-	if p.SpotCost > 0 {
-		netReturn = p.RealizedPnL() / p.SpotCost
+	if notional := max(p.SpotCost, p.SpotProceeds); notional > 0 {
+		netReturn = p.RealizedPnL() / notional
 	}
 	row := []string{
-		closedAt.Format(time.RFC3339), p.ID, p.Inst.Key(), p.OpenedAt.Format(time.RFC3339), p.CloseReason,
-		num(p.ContractsSold), num(p.SpotBought), num(p.SpotSold), num(p.EntryBasis), num(p.ExpectedNet),
-		num(p.ExitBasis), num(p.SpotCost), num(p.SpotProceeds), num(p.FutSellNotional), num(p.FutBuyNotional),
-		num(p.SpotFees), num(p.FutFees), num(p.Funding), num(p.RealizedPnL()), num(netReturn),
+		closedAt.Format(time.RFC3339), p.ID, string(p.Dir()), p.Inst.Key(), p.OpenedAt.Format(time.RFC3339),
+		p.CloseReason, num(max(p.ContractsSold, p.ContractsBought)), num(p.SpotBought), num(p.SpotSold),
+		num(p.EntryBasis), num(p.ExpectedNet), num(p.ExitBasis), num(p.SpotCost), num(p.SpotProceeds),
+		num(p.FutSellNotional), num(p.FutBuyNotional), num(p.SpotFees), num(p.FutFees), num(p.Funding),
+		num(p.InterestPaid + p.InterestBase), num(p.RealizedPnL()), num(netReturn),
 	}
 	if err := w.Write(row); err != nil {
 		return err

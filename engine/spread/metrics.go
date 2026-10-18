@@ -11,6 +11,8 @@ type Metrics struct {
 	Fees          prometheus.Counter
 	Funding       prometheus.Gauge
 	Trades        *prometheus.CounterVec
+	MarketData    *prometheus.CounterVec
+	WSConnected   *prometheus.GaugeVec
 }
 
 // NewMetrics creates and registers the strategy metrics.
@@ -26,7 +28,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}),
 		Basis: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "bot_spread_exit_basis",
-			Help: "Executable exit basis of each held position",
+			Help: "Executable exit spread of each held position, in the position's favour",
 		}, []string{"instrument"}),
 		RealizedPnL: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "bot_spread_realized_pnl_usdt",
@@ -44,7 +46,15 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "bot_spread_positions_total",
 			Help: "Positions opened and closed since start",
 		}, []string{"action"}),
+		MarketData: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "bot_spread_market_data_requests_total",
+			Help: "Ticker and orderbook requests by market and the source that served them (ws or rest)",
+		}, []string{"kind", "market", "source"}),
+		WSConnected: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "bot_spread_websocket_connected",
+			Help: "1 while the websocket connection is up",
+		}, []string{"conn"}),
 	}
-	reg.MustRegister(m.Balance, m.OpenPositions, m.Basis, m.RealizedPnL, m.Fees, m.Funding, m.Trades)
+	reg.MustRegister(m.Balance, m.OpenPositions, m.Basis, m.RealizedPnL, m.Fees, m.Funding, m.Trades, m.MarketData, m.WSConnected)
 	return m
 }
