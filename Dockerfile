@@ -21,7 +21,7 @@ WORKDIR /data
 VOLUME /data
 
 # Prometheus metrics.
-EXPOSE 2112
+EXPOSE 2113
 
 # GATEIO_API_KEY and GATEIO_API_SECRET must be supplied at runtime, never baked into the image.
 ENTRYPOINT ["/app/trading_bot", "-exchange-config", "/app/config_example.json", "-strategy-config", "/app/strategy.json"]

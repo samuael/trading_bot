@@ -36,7 +36,7 @@ go build -o trading_bot . && ./trading_bot -v     # -v logs why candidates were 
 ```
 [strategy.json](strategy.json) ships with **`"dry_run": true`**: the bot logs the trades it would make without placing any. Run it like that first, then set it to `false`.
 
-Each closed position adds a row to `trades.csv` with entry and exit spreads, fees, funding and net profit. Open positions are saved to `positions.json`, so a restart picks them up again. Balance logging to `profit_log.csv` and Prometheus on `:2112` work as before, with new series for P&L, fees and funding.
+Each closed position adds a row to `trades.csv` with entry and exit spreads, fees, funding and net profit. Open positions are saved to `positions.json`, so a restart picks them up again. Balance logging to `profit_log.csv` and Prometheus on `:2113` work as before, with new series for P&L, fees and funding.
 
 ## What changed
 - **Replaced:** the old engine, the `collections` package and the candle-history selection. The new code is in [engine/spread/](engine/spread/): `plan.go`, `pricing.go` and `position.go` hold the math, `executor.go` places orders, `engine.go` runs the loop, and `client.go` talks to GateIO.

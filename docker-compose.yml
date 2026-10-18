@@ -10,7 +10,7 @@ services:
       # Edit strategy.json (e.g. dry_run) and restart, no rebuild needed.
       - ./strategy.json:/app/strategy.json:ro
     ports:
-      - "127.0.0.1:2112:2112"
+      - "127.0.0.1:2113:2113"
     # On SIGTERM the bot finishes any order sequence in flight (up to 30s) and saves its positions; open positions
     # are resumed on the next start, not closed.
     stop_grace_period: 45s
