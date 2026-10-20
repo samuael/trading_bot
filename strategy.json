@@ -1,5 +1,5 @@
 {
-  "dry_run": true,
+  "dry_run": false,
   "min_entry_spread": 0.005,
   "max_entry_spread": 0.03,
   "max_index_deviation": 0.005,
