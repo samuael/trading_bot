@@ -18,7 +18,6 @@ import (
 	exchange "github.com/thrasher-corp/gocryptotrader/exchanges"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/asset"
 	"github.com/thrasher-corp/gocryptotrader/exchanges/gateio"
-	"github.com/thrasher-corp/gocryptotrader/exchanges/order"
 	"github.com/thrasher-corp/gocryptotrader/types"
 )
 
@@ -448,31 +447,34 @@ func (c *GateIOClient) SpotOrder(ctx context.Context, req SpotOrderRequest) (Spo
 	return fill, nil
 }
 
+// FuturesOrder places the order directly rather than through gocryptotrader's SubmitOrder, which rejects GateIO's
+// "ioc" finish_as on a partially filled IOC order after the order has already executed.
 func (c *GateIOClient) FuturesOrder(ctx context.Context, req FuturesOrderRequest) (FuturesFill, error) {
-	s := &order.Submit{
-		Exchange:    c.exch.GetName(),
-		Pair:        req.Contract,
-		AssetType:   asset.USDTMarginedFutures,
-		Side:        order.Long,
-		Type:        order.Limit,
-		Price:       req.Price,
-		Amount:      req.Contracts,
-		TimeInForce: order.ImmediateOrCancel,
-		ReduceOnly:  req.ReduceOnly,
-	}
+	size := req.Contracts
 	if req.Sell {
-		s.Side = order.Short
+		size = -size
 	}
-	if req.Price == 0 {
-		s.Type = order.Market
+	body := map[string]any{
+		"contract": req.Contract.String(),
+		"size":     size,
+		"iceberg":  0,
+		"price":    strconv.FormatFloat(req.Price, 'f', -1, 64),
+		"tif":      "ioc",
 	}
-	resp, err := c.exch.SubmitOrder(ctx, s)
-	if err != nil {
+	if req.ReduceOnly {
+		body["reduce_only"] = true
+	}
+	var o gateio.Order
+	if err := c.do(ctx, http.MethodPost, "futures/"+settlement.Lower().String()+"/orders", nil, body, true, &o); err != nil {
 		return FuturesFill{}, err
 	}
-	o, err := c.exch.GetSingleFuturesOrder(ctx, settlement, resp.OrderID)
-	if err != nil {
-		return FuturesFill{}, fmt.Errorf("futures order %s placed but fill unknown: %w", resp.OrderID, err)
+	if o.Status == "open" {
+		id := strconv.FormatInt(o.ID, 10)
+		got, err := c.exch.GetSingleFuturesOrder(ctx, settlement, id)
+		if err != nil {
+			return FuturesFill{}, fmt.Errorf("futures order %s placed but fill unknown: %w", id, err)
+		}
+		o = *got
 	}
 	fill := FuturesFill{Contracts: math.Abs(o.Size) - math.Abs(o.RemainingAmount), AvgPrice: o.FillPrice.Float64()}
 	if fill.Contracts <= 0 {

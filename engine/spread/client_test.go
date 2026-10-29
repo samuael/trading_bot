@@ -127,3 +127,42 @@ func TestSignedRequestSurfacesErrors(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "INVALID_PARAM_VALUE")
 }
+
+func TestFuturesOrderPartialIOCFill(t *testing.T) {
+	t.Parallel()
+	client, exch, requests := newTestGateIOClient(t, func(w http.ResponseWriter, _ recordedRequest) {
+		_, _ = w.Write([]byte(`{"id":42,"contract":"PARTI_USDT","size":10,"left":4,"price":"0.1234","fill_price":"0.1233",` +
+			`"tkfr":"0.0005","tif":"ioc","status":"finished","finish_as":"ioc"}`))
+	})
+	fill, err := client.FuturesOrder(t.Context(), FuturesOrderRequest{Contract: usdtPair("PARTI"), Contracts: 10, Price: 0.1234})
+	require.NoError(t, err)
+	assert.Equal(t, FuturesFill{Contracts: 6, AvgPrice: 0.1233, FeeRate: 0.0005}, fill)
+
+	reqs := requests()
+	require.Len(t, reqs, 1)
+	r := reqs[0]
+	assert.Equal(t, http.MethodPost, r.method)
+	assert.Equal(t, "/api/v4/futures/usdt/orders", r.path)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal([]byte(r.body), &body))
+	assert.Equal(t, map[string]any{
+		"contract": "PARTI_USDT", "size": 10.0, "iceberg": 0.0, "price": "0.1234", "tif": "ioc",
+	}, body)
+	assertSigned(t, exch, r)
+}
+
+func TestFuturesOrderMarketSell(t *testing.T) {
+	t.Parallel()
+	client, _, requests := newTestGateIOClient(t, func(w http.ResponseWriter, _ recordedRequest) {
+		_, _ = w.Write([]byte(`{"id":43,"size":-5,"left":0,"fill_price":"2.5","status":"finished","finish_as":"filled"}`))
+	})
+	fill, err := client.FuturesOrder(t.Context(), FuturesOrderRequest{Contract: usdtPair("SAND"), Sell: true, Contracts: 5, ReduceOnly: true})
+	require.NoError(t, err)
+	assert.Equal(t, 5.0, fill.Contracts)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal([]byte(requests()[0].body), &body))
+	assert.Equal(t, -5.0, body["size"])
+	assert.Equal(t, "0", body["price"])
+	assert.Equal(t, true, body["reduce_only"])
+}
