@@ -62,6 +62,19 @@ type Config struct {
 	// LiquidationBuffer force closes a position when the mark price is within this fraction of the liquidation price.
 	LiquidationBuffer float64 `json:"liquidation_buffer"`
 
+	// MinSpreadPersistSeconds only opens a position once its entry has qualified continuously for this long. Brief
+	// spikes are usually the perp moving ahead of spot, and the spot hedge then misses its limit. Zero enters at once.
+	MinSpreadPersistSeconds int `json:"min_spread_persist_seconds"`
+	// HedgeFailCooldownMinutes stops an instrument from being entered again for this long after its spot hedge
+	// failed and the perp leg had to be unwound. The pause doubles with each consecutive failure, up to a day.
+	HedgeFailCooldownMinutes int `json:"hedge_fail_cooldown_minutes"`
+	// MaxHedgeFailuresPerHour pauses all new entries for an hour once this many hedges failed within an hour.
+	// Zero disables the breaker.
+	MaxHedgeFailuresPerHour int `json:"max_hedge_failures_per_hour"`
+	// SweepIdleMargin returns USDT left in isolated margin accounts that hold no loan and no managed position to the
+	// spot account, at startup and at every instrument refresh.
+	SweepIdleMargin bool `json:"sweep_idle_margin"`
+
 	// MinFundingRate skips contracts whose current funding rate, signed in the position's favour, is below it: a
 	// carry short receives positive funding, a reverse long receives negative funding.
 	MinFundingRate float64 `json:"min_funding_rate"`
@@ -86,37 +99,41 @@ type Config struct {
 // DefaultConfig returns the default strategy parameters.
 func DefaultConfig() Config {
 	return Config{
-		DryRun:                 true,
-		MinEntrySpread:         0.005,
-		MaxEntrySpread:         0.03,
-		MaxIndexDeviation:      0.005,
-		ExitSpread:             0.001,
-		MinNetProfit:           0.001,
-		EnableReverse:          true,
-		MarginCollateralRatio:  0.5,
-		MarginRiskFloor:        1.3,
-		ExpectedHoldHours:      24,
-		UseWebsocket:           true,
-		WSBookMaxAgeSeconds:    30,
-		MaxOpenPositions:       10,
-		MinTradeNotional:       5,
-		FuturesMarginReserve:   0.1,
-		AutoRebalance:          true,
-		MaxSlippage:            0.002,
-		HedgeSlippage:          0.002,
-		ExitSlippage:           0.002,
-		LiquidationBuffer:      0.15,
-		MinFundingRate:         0,
-		MinSpotVolume24h:       50_000,
-		MinFuturesVolume24h:    50_000,
-		MaxCandidates:          10,
-		OrderbookDepth:         20,
-		TickIntervalSeconds:    5,
-		UniverseRefreshMinutes: 360,
-		BalanceLogMinutes:      5,
-		FeeCacheMinutes:        60,
-		StateFile:              "positions.json",
-		LedgerFile:             "trades.csv",
+		DryRun:                   true,
+		MinEntrySpread:           0.005,
+		MaxEntrySpread:           0.03,
+		MaxIndexDeviation:        0.005,
+		ExitSpread:               0.001,
+		MinNetProfit:             0.001,
+		EnableReverse:            true,
+		MarginCollateralRatio:    0.5,
+		MarginRiskFloor:          1.3,
+		ExpectedHoldHours:        24,
+		UseWebsocket:             true,
+		WSBookMaxAgeSeconds:      30,
+		MaxOpenPositions:         10,
+		MinTradeNotional:         5,
+		FuturesMarginReserve:     0.1,
+		AutoRebalance:            true,
+		MaxSlippage:              0.002,
+		HedgeSlippage:            0.002,
+		ExitSlippage:             0.002,
+		LiquidationBuffer:        0.15,
+		MinSpreadPersistSeconds:  10,
+		HedgeFailCooldownMinutes: 60,
+		MaxHedgeFailuresPerHour:  3,
+		SweepIdleMargin:          true,
+		MinFundingRate:           0,
+		MinSpotVolume24h:         50_000,
+		MinFuturesVolume24h:      50_000,
+		MaxCandidates:            10,
+		OrderbookDepth:           20,
+		TickIntervalSeconds:      5,
+		UniverseRefreshMinutes:   360,
+		BalanceLogMinutes:        5,
+		FeeCacheMinutes:          60,
+		StateFile:                "positions.json",
+		LedgerFile:               "trades.csv",
 	}
 }
 
@@ -181,6 +198,9 @@ func (c Config) Validate() error {
 		if v < 0 || v >= 0.05 {
 			errs = append(errs, fmt.Errorf("%s must be in [0, 0.05)", name))
 		}
+	}
+	if c.MinSpreadPersistSeconds < 0 || c.HedgeFailCooldownMinutes < 0 || c.MaxHedgeFailuresPerHour < 0 {
+		errs = append(errs, errors.New("min_spread_persist_seconds, hedge_fail_cooldown_minutes and max_hedge_failures_per_hour must not be negative"))
 	}
 	if c.MaxCandidates <= 0 || c.OrderbookDepth == 0 {
 		errs = append(errs, errors.New("max_candidates and orderbook_depth must be positive"))

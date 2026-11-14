@@ -1,49 +1,52 @@
-I rewrote the bot as a real two-leg spread trade with your four settings built in. Everything builds and vets clean, and the 24 offline tests pass, including under `-race`. A separate test against GateIO's live public data also passed. No live orders have been placed yet. The changes are staged but not committed.
+# GateIO spot/perpetual spread bot
+
+Buys spot and shorts the USDT perpetual of the same coin when the perp trades far enough above spot ("carry"), then unwinds both legs once the gap closes. The position is hedged, so it profits from the gap closing and from funding paid to shorts, not from price moves. Reverse trading (sell borrowed spot, long the perp) exists but is **off** in [strategy.json](strategy.json); see below.
 
 ## How it trades
-Every 5 seconds the bot does two things.
+Every 5 seconds the bot:
 
-**It checks open positions.** It compares them with the exchange and pulls in funding payments. It closes a position when the basis you'd actually get on exit (perp ask vs spot bid) drops to **0.1% or less**.
+1. **Checks open positions.** It reconciles them with the exchange, records funding, and closes a position once the executable exit spread (perp ask vs spot bid) is at or below `exit_spread` (0.05%).
+2. **Looks for entries.** Tickers shortlist up to `max_candidates` pairs, and the real order books then price each one. A pair qualifies when all of these hold:
+   - the gross executable spread (perp bid vs spot ask) is between `min_entry_spread` (0.8%) and `max_entry_spread` (2.5%);
+   - `spread − exit_spread − taker fees on all four legs ≥ min_net_profit` (0.3%). Fees come from your account's fee tier;
+   - funding is at least `min_funding_rate`, so the short is paid while it waits;
+   - the perp index is within 0.5% of spot, so both markets track the same asset;
+   - both markets trade at least 250k USDT a day.
+3. **Waits for the spread to persist.** A qualifying pair is only entered after it has qualified continuously for `min_spread_persist_seconds` (10s). Brief spikes are usually the perp moving ahead of spot, and they vanish before the spot leg can fill.
 
-**It looks for new entries.** One ticker call per market shortlists pairs. It then reads the real order books for the best 10 and opens a position only if both of these hold:
-- the **gross spread is at least 0.5%** (perp bid vs spot ask, using the prices you'd actually fill at), and
-- `spread − 0.1% exit − fees on all four legs` is **at least `min_net_profit`**, which defaults to 0.1%.
+**Execution.** The perp short goes first as an IOC limit. The spot buy then hedges what filled, with an allowance of up to half the expected profit, so a slightly moved market still hedges at a profit. Unhedged contracts are bought back immediately. Closes keep both legs matched and fall back to market orders after three missed limits.
 
-Your fee rates come from GateIO's personal-fee endpoint and are cached for an hour.
+**Sizing.** Free capital is split across free slots (`max_open_positions`: 5). Each position is between 10 and 40 USDT and limited by order-book depth within 0.2% of the best price.
 
-**Sizing ("as far as funds allow"):** free capital is split evenly across the open slots, up to 10 positions. Each position is limited by:
-- what both accounts can fund: spot pays for the coins, futures holds 1x margin plus a 10% reserve;
-- order-book depth within 0.2% of the best price;
-- a $5 minimum.
-
-**Execution:** the perp short goes in first as an IOC limit order. The spot buy then hedges whatever filled. If the spot order fills only partly or fails, the extra short is bought back immediately. Closes keep both legs matched. If a close misses its limits three times, it switches to market orders.
-
-## Things you should know
-- **Same-name, different-asset markets.** The live test showed `OPENAI_USDT` with a 74% "spread". The perp and the spot token almost certainly track different things. I added two guards: the perp's index price must be within 0.5% of the spot price, and any spread above 3% is rejected. Both cases are now filtered out.
-- **Fees can eat the 0.5% spread.** Your fee rates determine how much of each spread you keep. For example, if round-trip taker fees are 0.3%, the bot needs about a 0.5% spread before it trades.
-- **Other safety rules:**
-  - If the perp is within 15% of its liquidation price, the position is closed.
-  - If the perp leg disappears (liquidated or closed by hand), the spot leg is sold.
-  - Positions the bot didn't open, such as anything left over from the old bot, are never touched, and that pair isn't traded.
-  - The futures account must be in single-position mode. The bot switches it automatically only if no positions are open.
-- **Automatic transfers.** With `auto_rebalance` on, the bot moves USDT between your spot and futures accounts so both sides can be funded. It's on by default; set it to `false` if you'd rather move funds yourself.
-- **Library version.** gocryptotrader is now pinned in [go.mod](go.mod) to the upstream commit your fork's `master` matches. The old code no longer compiled against any available version.
+## Safeguards
+- **Hedge-failure cooldown.** If the spot hedge misses and the perp has to be unwound, that pair is paused for `hedge_fail_cooldown_minutes` (60). The pause doubles with each consecutive failure, up to 24h.
+- **Circuit breaker.** After `max_hedge_failures_per_hour` (3) failed hedges, all new entries stop for an hour.
+- **Idle margin sweep.** At startup and every instrument refresh, USDT sitting in isolated margin accounts with no loan and no managed position goes back to spot (`sweep_idle_margin`). Accounts with an unpaid loan, or holding coins, are logged for you to clean up by hand.
+- **Other guards.**
+  - A position whose perp is within 15% of liquidation is closed.
+  - If the perp leg disappears, the spot leg is sold.
+  - Perp positions the bot didn't open are never touched, and that pair isn't traded.
+  - The futures account must be in single-position mode.
 
 ## Running it
 ```sh
 export GATEIO_API_KEY=... GATEIO_API_SECRET=...
-go build -o trading_bot . && ./trading_bot -v     # -v logs why candidates were rejected
+go build -o trading_bot .
+./trading_bot -dry-run -v   # live data, no orders or transfers; -v logs why candidates were rejected
+./trading_bot               # trades for real when strategy.json has "dry_run": false
 ```
-[strategy.json](strategy.json) ships with **`"dry_run": true`**: the bot logs the trades it would make without placing any. Run it like that first, then set it to `false`.
+Run **only one instance per account**. Each instance owns the positions in its own `positions.json` and treats every other perp position as unmanaged. Two instances would compete for the same balances.
 
-Each closed position adds a row to `trades.csv` with entry and exit spreads, fees, funding and net profit. Open positions are saved to `positions.json`, so a restart picks them up again. Balance logging to `profit_log.csv` and Prometheus on `:2113` work as before, with new series for P&L, fees and funding.
+State and output:
+- `positions.json` holds open positions, so a restart resumes them.
+- `trades.csv` gets one row per closed position: entry and exit spread, fees, funding, net P&L.
+- `profit_log.csv` gets the total balance every 5 minutes.
+- Prometheus listens on `:2113`. `bot_spread_hedge_failures_total` should stay near zero.
 
-## What changed
-- **Replaced:** the old engine, the `collections` package and the candle-history selection. The new code is in [engine/spread/](engine/spread/): `plan.go`, `pricing.go` and `position.go` hold the math, `executor.go` places orders, `engine.go` runs the loop, and `client.go` talks to GateIO.
-- **Removed:** the committed 26 MB binary is no longer tracked, and [.gitignore](.gitignore) is fixed.
-- **Live test:** run it with `go test -tags live -run Live -v ./engine/spread`.
+Tests: `go test -race ./...` runs offline. `go test -tags live -run Live -v ./engine/spread` checks public market data.
 
-**Not done:**
-- Trading when the perp is cheaper than spot (sell spot, long the perp) is still out, as agreed.
-- Prices come from REST polling every 5 seconds rather than WebSocket feeds.
-- The order-placing code has only been tested against the fake exchange. The first live run with keys will be its first real check.
+## Why reverse trading is off
+Reverse entries sell coins borrowed on isolated margin. On the thin pairs where the perp trades below spot, the borrow usually fails or costs a lot. Each failed attempt left collateral in a margin account, and the bot used to retry every 5 seconds. The cooldown now stops the retries, but the borrow costs and failure rate still make reverse a net loser on GateIO alts. Set `enable_reverse` to `true` only if you have a reason to.
+
+## What to expect
+Real carry spreads of 0.8% or more on liquid GateIO pairs are rare and short-lived; most of the time the bot will sit idle. That's deliberate. At 0.3% round-trip fees, smaller spreads don't leave enough after slippage, and trading them is what lost money before. Profit comes from occasional dislocations plus funding while positions are held. Expect few trades and small, positive results per trade, not steady daily income.

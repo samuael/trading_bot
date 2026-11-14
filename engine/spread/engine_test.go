@@ -101,6 +101,10 @@ func (c *fakeClient) MarginAccount(context.Context, currency.Pair) (MarginAccoun
 	return c.margin, nil
 }
 
+func (c *fakeClient) MarginAccounts(context.Context) (map[string]MarginAccount, error) {
+	return map[string]MarginAccount{testKey: c.margin}, nil
+}
+
 func (c *fakeClient) Repay(_ context.Context, _ currency.Pair, amount float64, all bool) error {
 	if all {
 		amount = c.margin.BaseOwed()
@@ -259,6 +263,7 @@ func newTestEngine(t *testing.T, c *fakeClient, mutate func(*Config)) *Engine {
 	cfg := DefaultConfig()
 	cfg.DryRun = false
 	cfg.AutoRebalance = false
+	cfg.MinSpreadPersistSeconds = 0 // enter on the first qualifying tick unless a test opts in
 	cfg.StateFile = filepath.Join(dir, "positions.json")
 	cfg.LedgerFile = filepath.Join(dir, "trades.csv")
 	if mutate != nil {

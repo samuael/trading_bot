@@ -106,6 +106,8 @@ type Client interface {
 	SpotBalance(ctx context.Context, ccy currency.Code) (available, locked float64, err error)
 	FuturesAccount(ctx context.Context) (*gateio.FuturesAccount, error)
 	MarginAccount(ctx context.Context, pair currency.Pair) (MarginAccount, error)
+	// MarginAccounts returns every isolated margin account, keyed by pair, e.g. "BTC_USDT".
+	MarginAccounts(ctx context.Context) (map[string]MarginAccount, error)
 	Positions(ctx context.Context) ([]gateio.Position, error)
 	// Transfer moves USDT between the "spot", "futures" and "margin" accounts. pair names the isolated margin
 	// account and is ignored otherwise.
@@ -251,19 +253,34 @@ func (c *GateIOClient) MarginAccount(ctx context.Context, pair currency.Pair) (M
 		return MarginAccount{}, err
 	}
 	for _, a := range accounts {
-		if !strings.EqualFold(a.CurrencyPair, pair.String()) {
-			continue
+		if strings.EqualFold(a.CurrencyPair, pair.String()) {
+			return toMarginAccount(a), nil
 		}
-		risk, _ := strconv.ParseFloat(a.Risk, 64)
-		return MarginAccount{
-			BaseAvailable:  a.Base.Available.Float64(),
-			BaseBorrowed:   a.Base.Borrowed.Float64(),
-			BaseInterest:   a.Base.Interest.Float64(),
-			QuoteAvailable: a.Quote.Available.Float64(),
-			Risk:           risk,
-		}, nil
 	}
 	return MarginAccount{}, nil
+}
+
+func (c *GateIOClient) MarginAccounts(ctx context.Context) (map[string]MarginAccount, error) {
+	accounts, err := c.exch.GetMarginAccountList(ctx, currency.EMPTYPAIR)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]MarginAccount, len(accounts))
+	for _, a := range accounts {
+		out[strings.ToUpper(a.CurrencyPair)] = toMarginAccount(a)
+	}
+	return out, nil
+}
+
+func toMarginAccount(a gateio.MarginAccountItem) MarginAccount {
+	risk, _ := strconv.ParseFloat(a.Risk, 64)
+	return MarginAccount{
+		BaseAvailable:  a.Base.Available.Float64(),
+		BaseBorrowed:   a.Base.Borrowed.Float64(),
+		BaseInterest:   a.Base.Interest.Float64(),
+		QuoteAvailable: a.Quote.Available.Float64(),
+		Risk:           risk,
+	}
 }
 
 func (c *GateIOClient) Positions(ctx context.Context) ([]gateio.Position, error) {

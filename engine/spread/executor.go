@@ -35,6 +35,13 @@ func (e *Engine) open(ctx context.Context, plan EntryPlan) (*Position, error) {
 		e.leverageSet[key] = true
 	}
 	if !carry {
+		// Collateral posted for an entry that ends without a position goes straight back to spot. Releasing is a
+		// no-op once it has been returned and refuses while a loan is outstanding.
+		defer func() {
+			if e.positions[key] == nil {
+				e.releaseCollateral(ctx, inst)
+			}
+		}()
 		if err := e.ensureCollateral(ctx, inst, plan.Notional*e.cfg.MarginCollateralRatio); err != nil {
 			return nil, fmt.Errorf("margin collateral: %w", err)
 		}
@@ -77,6 +84,11 @@ func (e *Engine) open(ctx context.Context, plan EntryPlan) (*Position, error) {
 
 	if err := e.trimHedge(ctx, pos, plan.Fees); err != nil {
 		e.log.Error("position is not fully hedged, retrying next tick", "instrument", key, "err", err)
+	}
+	if hedged := pos.HedgedContracts(); hedged < fut.Contracts-epsilon {
+		e.noteHedgeFailure(key, fut.Contracts, hedged)
+	} else {
+		delete(e.hedgeFails, key)
 	}
 	if _, ok := e.positions[key]; !ok {
 		return nil, nil

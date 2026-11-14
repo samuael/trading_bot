@@ -11,6 +11,7 @@ type Metrics struct {
 	Fees          prometheus.Counter
 	Funding       prometheus.Gauge
 	Trades        *prometheus.CounterVec
+	HedgeFailures prometheus.Counter
 	MarketData    *prometheus.CounterVec
 	WSConnected   *prometheus.GaugeVec
 }
@@ -46,6 +47,10 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "bot_spread_positions_total",
 			Help: "Positions opened and closed since start",
 		}, []string{"action"}),
+		HedgeFailures: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "bot_spread_hedge_failures_total",
+			Help: "Entries whose spot hedge failed or filled partly, forcing perp contracts to be unwound",
+		}),
 		MarketData: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "bot_spread_market_data_requests_total",
 			Help: "Ticker and orderbook requests by market and the source that served them (ws or rest)",
@@ -55,6 +60,6 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Help: "1 while the websocket connection is up",
 		}, []string{"conn"}),
 	}
-	reg.MustRegister(m.Balance, m.OpenPositions, m.Basis, m.RealizedPnL, m.Fees, m.Funding, m.Trades, m.MarketData, m.WSConnected)
+	reg.MustRegister(m.Balance, m.OpenPositions, m.Basis, m.RealizedPnL, m.Fees, m.Funding, m.Trades, m.HedgeFailures, m.MarketData, m.WSConnected)
 	return m
 }

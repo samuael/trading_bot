@@ -64,7 +64,33 @@ type Engine struct {
 	borrowRates  map[string]cachedRate
 	leverageSet  map[string]bool
 	spotBids     map[string]float64
+
+	// qualified records since when each instrument's entry has qualified without interruption.
+	qualified map[string]qualifiedEntry
+	// cooldown holds instruments back from new entries until the given time; hedgeFails counts consecutive
+	// failed hedges per instrument and recentFailures every failed hedge within the last hour.
+	cooldown       map[string]time.Time
+	hedgeFails     map[string]int
+	recentFailures []time.Time
+	// pausedUntil stops all new entries after too many failed hedges.
+	pausedUntil time.Time
+	// drySwept is the idle margin collateral a dry run would have returned to spot; dry runs size with it.
+	drySwept float64
 }
+
+type qualifiedEntry struct {
+	dir   Direction
+	since time.Time
+}
+
+const (
+	// maxCooldown caps the doubling pause of an instrument whose hedges keep failing.
+	maxCooldown = 24 * time.Hour
+	// errorCooldown holds back an instrument whose entry failed before any order filled.
+	errorCooldown = 5 * time.Minute
+	// breakerPause is how long all entries stop once MaxHedgeFailuresPerHour is reached.
+	breakerPause = time.Hour
+)
 
 type cachedFees struct {
 	fees Fees
@@ -106,6 +132,9 @@ func NewEngine(cfg Config, client Client, market MarketData, logger *slog.Logger
 		borrowRates: make(map[string]cachedRate),
 		leverageSet: make(map[string]bool),
 		spotBids:    make(map[string]float64),
+		qualified:   make(map[string]qualifiedEntry),
+		cooldown:    make(map[string]time.Time),
+		hedgeFails:  make(map[string]int),
 	}, nil
 }
 
@@ -143,7 +172,10 @@ func (e *Engine) Run(ctx context.Context) error {
 		"max_open_positions", e.cfg.MaxOpenPositions,
 		"reverse", e.cfg.EnableReverse,
 		"websocket", e.cfg.UseWebsocket,
+		"min_spread_persist_seconds", e.cfg.MinSpreadPersistSeconds,
+		"hedge_fail_cooldown_minutes", e.cfg.HedgeFailCooldownMinutes,
 	)
+	e.sweepIdleMargin(ctx)
 
 	tick := time.NewTicker(time.Duration(e.cfg.TickIntervalSeconds) * time.Second)
 	universe := time.NewTicker(minutes(e.cfg.UniverseRefreshMinutes))
@@ -166,6 +198,7 @@ func (e *Engine) Run(ctx context.Context) error {
 			if err := e.refreshUniverse(ctx); err != nil {
 				e.log.Error("refresh instruments", "err", err)
 			}
+			e.sweepIdleMargin(ctx)
 		case <-balances.C:
 			e.logBalances(ctx)
 		}
@@ -358,7 +391,9 @@ func (e *Engine) scan(ctx context.Context) ([]candidate, error) {
 		e.spotBids[strings.ToUpper(t.CurrencyPair)] = t.HighestBid.Float64()
 	}
 	slots := e.cfg.MaxOpenPositions - len(e.positions)
-	if slots <= 0 {
+	now := e.now()
+	if slots <= 0 || now.Before(e.pausedUntil) {
+		clear(e.qualified)
 		return nil, nil
 	}
 	futuresTickers, err := e.market.FuturesTickers(ctx)
@@ -367,8 +402,14 @@ func (e *Engine) scan(ctx context.Context) ([]candidate, error) {
 	}
 	candidates := rankCandidates(e.universe, spotTickers, futuresTickers, e.cfg, func(key string) bool {
 		_, held := e.positions[key]
-		return held || e.blocked[key]
+		return held || e.blocked[key] || now.Before(e.cooldown[key])
 	})
+	// An entry that dropped off the shortlist has to qualify from scratch.
+	shortlisted := make(map[string]bool, len(candidates))
+	for _, c := range candidates {
+		shortlisted[c.inst.Key()] = true
+	}
+	maps.DeleteFunc(e.qualified, func(key string, _ qualifiedEntry) bool { return !shortlisted[key] })
 	if len(candidates) == 0 {
 		return nil, nil
 	}
@@ -384,12 +425,17 @@ func (e *Engine) scan(ctx context.Context) ([]candidate, error) {
 		key := c.inst.Key()
 		budget := tradeBudget(funds.usable(c.dir, e.cfg), slots, e.cfg)
 		if budget == 0 {
+			delete(e.qualified, key) // not priced this tick, so it has not been seen qualifying
 			e.log.Debug("insufficient funds for another position", "instrument", key, "direction", c.dir)
 			continue
 		}
 		plan, err := e.evaluate(ctx, c, budget)
 		if err != nil {
+			delete(e.qualified, key)
 			e.log.Debug("candidate rejected", "instrument", key, "direction", c.dir, "ticker_spread", c.tickerBasis, "reason", err)
+			continue
+		}
+		if !e.persisted(key, plan) {
 			continue
 		}
 		if e.cfg.DryRun {
@@ -404,14 +450,119 @@ func (e *Engine) scan(ctx context.Context) ([]candidate, error) {
 		pos, err := e.open(ctx, plan)
 		if err != nil {
 			e.log.Error("open position", "instrument", key, "direction", c.dir, "err", err)
+			e.cooldown[key] = e.now().Add(errorCooldown)
 			continue
 		}
 		if pos != nil {
+			delete(e.qualified, key)
 			slots--
 			funds.spend(plan.Direction, max(pos.SpotCost, pos.SpotProceeds), e.cfg)
 		}
+		if e.now().Before(e.pausedUntil) {
+			break
+		}
 	}
 	return candidates, nil
+}
+
+// persisted reports whether plan's entry has qualified for at least MinSpreadPersistSeconds without interruption,
+// starting the clock the first time it qualifies.
+func (e *Engine) persisted(key string, plan EntryPlan) bool {
+	need := time.Duration(e.cfg.MinSpreadPersistSeconds) * time.Second
+	if need <= 0 {
+		return true
+	}
+	now := e.now()
+	q, ok := e.qualified[key]
+	if !ok || q.dir != plan.Direction {
+		e.qualified[key] = qualifiedEntry{dir: plan.Direction, since: now}
+		e.log.Info("entry qualified, waiting for the spread to persist",
+			"instrument", key, "direction", plan.Direction, "spread", plan.Basis, "expected_net", plan.ExpectedNet, "wait", need)
+		return false
+	}
+	return now.Sub(q.since) >= need
+}
+
+// noteHedgeFailure pauses an instrument whose spot hedge missed, doubling the pause with each consecutive miss, and
+// stops all entries for an hour once MaxHedgeFailuresPerHour misses happened within an hour. Without it a spread
+// the spot leg cannot capture is retried every tick, paying fees and the perp spread each time.
+func (e *Engine) noteHedgeFailure(key string, filled, hedged float64) {
+	now := e.now()
+	n := e.hedgeFails[key] + 1
+	e.hedgeFails[key] = n
+	pause := min(minutes(e.cfg.HedgeFailCooldownMinutes)<<min(n-1, 10), maxCooldown)
+	e.cooldown[key] = now.Add(pause)
+	delete(e.qualified, key)
+	e.metrics.HedgeFailures.Inc()
+	e.log.Warn("spot hedge fell short, instrument paused",
+		"instrument", key, "perp_filled", filled, "hedged", hedged, "consecutive_failures", n, "paused_for", pause)
+
+	if e.cfg.MaxHedgeFailuresPerHour <= 0 {
+		return
+	}
+	recent := e.recentFailures[:0]
+	for _, t := range e.recentFailures {
+		if now.Sub(t) < time.Hour {
+			recent = append(recent, t)
+		}
+	}
+	e.recentFailures = append(recent, now)
+	if len(e.recentFailures) >= e.cfg.MaxHedgeFailuresPerHour {
+		e.pausedUntil = now.Add(breakerPause)
+		e.log.Error("too many failed hedges, pausing all new entries",
+			"failures_last_hour", len(e.recentFailures), "until", e.pausedUntil.Format(time.RFC3339))
+		e.recentFailures = nil
+	}
+}
+
+// sweepIdleMargin returns USDT left in isolated margin accounts to the spot account so it can fund positions again.
+// Reverse entries post collateral there; an entry that aborts, or a loan repaid short by dust, used to strand it.
+// Accounts holding a loan or backing a managed position are left alone.
+func (e *Engine) sweepIdleMargin(ctx context.Context) {
+	if !e.cfg.SweepIdleMargin {
+		return
+	}
+	accounts, err := e.client.MarginAccounts(ctx)
+	if err != nil {
+		e.log.Warn("list margin accounts", "err", err)
+		return
+	}
+	var swept float64
+	for _, key := range slices.Sorted(maps.Keys(accounts)) {
+		acc := accounts[key]
+		base, ok := strings.CutSuffix(key, "_"+settlement.String())
+		if _, held := e.positions[key]; held || !ok {
+			continue
+		}
+		if acc.BaseAvailable > 0 && acc.BaseOwed() == 0 {
+			e.log.Warn("isolated margin account holds base the bot does not manage; move or sell it manually", "pair", key, "base", acc.BaseAvailable)
+		}
+		amount := floorTo(acc.QuoteAvailable, 2)
+		if amount < 0.01 {
+			continue
+		}
+		if acc.BaseOwed() > 0 || acc.BaseAvailable < 0 {
+			e.log.Warn("isolated margin account has an unpaid loan; its collateral stays until the loan is repaid",
+				"pair", key, "usdt", amount, "base_owed", acc.BaseOwed(), "base_available", acc.BaseAvailable)
+			continue
+		}
+		if e.cfg.DryRun {
+			e.log.Info("dry run: would return idle margin collateral to spot", "pair", key, "usdt", amount)
+			swept += amount
+			continue
+		}
+		if err := e.client.Transfer(ctx, accountMargin, accountSpot, usdtPair(base), amount); err != nil {
+			e.log.Warn("return idle margin collateral", "pair", key, "usdt", amount, "err", err)
+			continue
+		}
+		swept += amount
+	}
+	if e.cfg.DryRun {
+		e.drySwept = swept
+	}
+	if swept > 0 {
+		e.log.Info("idle margin collateral returned to spot", "usdt", swept, "dry_run", e.cfg.DryRun)
+	}
 }
 
 func (e *Engine) evaluate(ctx context.Context, c candidate, budget float64) (EntryPlan, error) {
@@ -475,6 +626,9 @@ func (e *Engine) freeFunds(ctx context.Context) (funds, error) {
 		return funds{}, fmt.Errorf("futures account: %w", err)
 	}
 	f := funds{spot: spotFree, futures: acc.Available.Float64()}
+	if e.cfg.DryRun {
+		f.spot += e.drySwept // a live run would have swept it back to spot
+	}
 
 	if e.cfg.AutoRebalance {
 		minTransfer := max(1, e.cfg.MinTradeNotional/2)

@@ -25,6 +25,7 @@ func main() {
 	metricsAddr := flag.String("metrics-addr", ":2113", "address serving Prometheus metrics")
 	profitLog := flag.String("profit-log", "profit_log.csv", "file receiving a total balance line every balance_log_minutes")
 	verbose := flag.Bool("v", false, "log rejected candidates and other debug detail")
+	forceDryRun := flag.Bool("dry-run", false, "evaluate and log trades without placing orders or moving funds, whatever the strategy config says")
 	httpTimeout := flag.Duration("http-timeout", time.Minute, "REST request timeout; full market lists are several MB")
 	flag.Parse()
 
@@ -37,6 +38,9 @@ func main() {
 	cfg, err := spread.LoadConfig(*strategyConfig)
 	if err != nil {
 		log.Fatal(err)
+	}
+	if *forceDryRun {
+		cfg.DryRun = true
 	}
 
 	apiKey, apiSecret := os.Getenv("GATEIO_API_KEY"), os.Getenv("GATEIO_API_SECRET")

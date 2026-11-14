@@ -126,14 +126,26 @@ func planEntry(dir Direction, inst Instrument, spotBook, futuresBook []Level, fe
 	}
 
 	// The perp leg goes first and must not fill worse than planned; the spot leg hedges it and gets an allowance.
+	hedge := hedgeAllowance(plan.ExpectedNet, cfg)
 	if carry {
 		plan.FuturesLimit = floorToStep(fut.Worst, inst.PriceTick)
-		plan.SpotLimit = ceilTo(spot.Worst*(1+cfg.HedgeSlippage), inst.SpotPricePrecision)
+		plan.SpotLimit = ceilTo(spot.Worst*(1+hedge), inst.SpotPricePrecision)
 	} else {
 		plan.FuturesLimit = ceilToStep(fut.Worst, inst.PriceTick)
-		plan.SpotLimit = floorTo(spot.Worst*(1-cfg.HedgeSlippage), inst.SpotPricePrecision)
+		plan.SpotLimit = floorTo(spot.Worst*(1-hedge), inst.SpotPricePrecision)
 	}
 	return plan, nil
+}
+
+// maxHedgeAllowance caps how far through the planned spot price the hedge may fill. It stays below the 2% capital
+// headroom so a buy limit never reserves more USDT than the budget holds.
+const maxHedgeAllowance = 0.01
+
+// hedgeAllowance is the price allowance of the spot hedge: cfg.HedgeSlippage, widened to half the expected net
+// return when that is larger. A hedge that misses its limit forces the perp leg to be unwound at a loss, while one
+// that fills up to half the expected return worse still leaves the position profitable.
+func hedgeAllowance(expectedNet float64, cfg Config) float64 {
+	return max(cfg.HedgeSlippage, min(expectedNet/2, maxHedgeAllowance))
 }
 
 // ExitPlan prices closing what remains of a position.
